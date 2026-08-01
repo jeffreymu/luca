@@ -1,8 +1,8 @@
 # ◆ Luca
 
-**Workspace-first multi-agent kanban delivery board** — 借鉴 [Routa](https://github.com/phodal/routa) 的核心思想实现的轻量级 Web 应用，完成任务价值的端到端交付。
+**Workspace-first multi-agent kanban delivery board** — LucaPi 旗下的轻量级 Web 应用，完成任务价值的端到端交付。
 
-Routa 把「目标、任务、会话、证据、评审」放在看板上而非埋在单个聊天线程里；Luca 完整复刻了这条交付流水线，并做到 **零 npm 依赖、单命令启动、离线可跑**。
+Luca 把「目标、任务、会话、证据、评审」放在看板上而非埋在单个聊天线程里，并做到 **零 npm 依赖、单命令启动、离线可跑**。
 
 ```bash
 npm start          # http://localhost:3210
@@ -13,7 +13,7 @@ npm test           # 28 项端到端冒烟检查
 
 ---
 
-## 从 Routa 借鉴的核心设计
+## LucaPi 核心设计
 
 ### 1. 看板即协同总线（Board as coordination bus）
 
@@ -43,7 +43,7 @@ Backlog ──▶ Todo ──▶ Dev ──▶ Review ──▶ Done
 
 ### 4. Entry Gates（不信任上游）
 
-Review Guard 的入门检查完整移植自 Routa：缺 Dev Evidence / 缺变更文件 / 缺逐条 AC 验证 / 缺测试证据 / 未提交或工作区脏 → 直接打回 Dev。Done Reporter 校验 Review verdict 必须为 APPROVED，否则打回 Review。
+Review Guard 的入门检查：缺 Dev Evidence / 缺变更文件 / 缺逐条 AC 验证 / 缺测试证据 / 未提交或工作区脏 → 直接打回 Dev。Done Reporter 校验 Review verdict 必须为 APPROVED，否则打回 Review。
 
 ### 5. Sessions & Traces 是一等公民
 
@@ -65,7 +65,7 @@ export LUCA_LLM_MODEL=gpt-4o-mini
 npm start
 ```
 
-3. **Simulated Provider**（默认）：离线、确定性，严格按泳道契约产出结构化工件。内置「不信任循环」演示——多 AC 卡片首轮 Dev 会留下一条单薄验证，Review Guard 必然打回，Dev 修复后二审通过，完整展示 Routa 的 distrust 语义。
+3. **Simulated Provider**（默认）：离线、确定性，严格按泳道契约产出结构化工件。内置「不信任循环」演示——多 AC 卡片首轮 Dev 会留下一条单薄验证，Review Guard 必然打回，Dev 修复后二审通过，完整展示 LucaPi 的 distrust 语义。
 
 真实 LLM 模式下，每个 specialist 用其泳道契约作为 system prompt，要求模型输出 JSON 工件；输出经 `normalize` 契约校验，**LLM 调用失败或输出不合法时自动回退 simulated provider**，并在 trace 中记录，保证交付流永不中断。Session 中会记录本次运行使用的 provider 名称。
 
@@ -130,7 +130,7 @@ public/               # 看板 SPA（泳道、卡片抽屉、工件时间线、s
 test/smoke.js         # 56 项端到端冒烟检查
 ```
 
-## 与 Routa 的取舍
+## 设计取舍
 
 保留：六泳道契约、distrust 链、entry gates、工件时间线、review loop + loop breaker、session/trace 审计、board automation。
-裁剪：ACP/MCP/A2A 协议适配、真实代码库/worktree 操作、GitHub 导入、Tauri 桌面端、定时任务与 webhook——这些在 Luca 中以 workspace 的 `repo_path` 元数据和 provider 抽象预留了扩展位。
+裁剪：ACP/MCP/A2A 协议适配、真实代码库/worktree 操作、GitHub 导入、桌面端、定时任务与 webhook——这些在 Luca 中以 workspace 的 `repo_path` 元数据和 provider 抽象预留了扩展位。
