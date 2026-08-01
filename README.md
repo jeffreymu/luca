@@ -6,10 +6,10 @@ Luca 把「目标、任务、会话、证据、评审」放在看板上而非埋
 
 ```bash
 npm start          # http://localhost:3210
-npm test           # 28 项端到端冒烟检查
+npm test           # 94 项端到端与平台集成检查
 ```
 
-要求 Node.js ≥ 22.5（使用内置 `node:http` 与 `node:sqlite`）。
+要求 Node.js ≥ 22.5（使用内置 `node:http` 与 `node:sqlite`）。涉及文件和命令工具的服务默认仅监听 `127.0.0.1`；如需远程部署，应在反向代理层配置身份认证与 TLS，再显式设置 `HOST`。
 
 ---
 
@@ -94,6 +94,28 @@ npm start
 | GET | `/api/cards/:id/sessions` · `/api/sessions/:id` | 会话与 trace 审计 |
 | GET | `/api/events` | SSE，看板实时刷新 |
 
+## 五阶段自主交付能力
+
+### 阶段 1：真实 Coding Agent Runtime
+
+真实 LLM 在 Dev 泳道进入工具调用循环，可使用 `read_file`、`write_file`、`list_files`、`search_files`、`run_command`、`git_status`、`git_diff`。所有文件路径限制在任务 worktree 内；命令以 `execFile` 无 Shell 执行，并受 allowlist 与 timeout 约束。
+
+### 阶段 2：隔离 Worktree 与真实证据
+
+卡片进入 Dev 时自动从 base commit 创建 `lucapi/<task>-<id>` 分支和独立 worktree。实现结束后自动运行项目检测到的 test/lint/typecheck、提交变更，并从 Git 采集真实 diff、changed files、commit SHA、command exit code 和 tool calls。Review 在独立阶段重新运行验证并检查真实 diff/clean 状态；卡片可 Push & PR。
+
+### 阶段 3：可靠持久化执行
+
+`jobs` 表提供 durable queue、优先级、attempt、max attempts、指数退避、lease、Cancel、Retry 与进程重启后的过期任务恢复。Board Automation UI 默认入队，由后台 Worker 执行；Schedule Tick 也进入同一队列。
+
+### 阶段 4：DAG、多 Agent 与可配置流程
+
+支持自然语言 Goal 拆卡、父子卡、dependencies、Ready Task、priority/assignee/tags；提供 Agent Registry、Team Run、团队消息和审批；Workflow 可创建卡片 DAG 并触发后台执行；每条泳道 Specialist 可修改 Prompt、启停并绑定独立 Provider。
+
+### 阶段 5：平台扩展
+
+提供 Skill Registry、MCP JSON-RPC 工具目录与执行、路径/符号链接/命令参数边界、可选 Docker Sandbox 生命周期、Repository Intelligence（文件树、语言分布、脚本和提交历史）、Harness/Fitness、Schedule、HMAC Webhook → Workflow Job，以及 GitHub Issues、PR 列表、评论和 PR 交付。
+
 ## Git / GitHub 操作
 
 顶栏 **⎇ Git** 面板对当前 workspace 的 worktree（`repo_path` 指向的本地仓库）提供：
@@ -127,10 +149,10 @@ src/providers.js     # LLM provider 抽象（simulated / OpenAI 兼容）
 src/git.js            # worktree git 操作（status / pull / commit+push）
 src/github.js         # GitHub REST API（slug 推断、创建/查找 PR）
 public/               # 看板 SPA（泳道、卡片抽屉、工件时间线、session/trace、Providers 与 Git 面板）
-test/smoke.js         # 56 项端到端冒烟检查
+test/smoke.js         # 60 项基础端到端检查
+test/platform.js      # 34 项真实 Agent、worktree、队列、DAG、安全与平台集成检查
 ```
 
-## 设计取舍
+## 设计边界
 
-保留：六泳道契约、distrust 链、entry gates、工件时间线、review loop + loop breaker、session/trace 审计、board automation。
-裁剪：ACP/MCP/A2A 协议适配、真实代码库/worktree 操作、GitHub 导入、桌面端、定时任务与 webhook——这些在 Luca 中以 workspace 的 `repo_path` 元数据和 provider 抽象预留了扩展位。
+当前版本聚焦本地 Web 交付运行时：真实 Tool Calling Coding Agent、任务级 worktree、证据驱动 Review、持久化队列、DAG、多 Agent 协作与可扩展工具平台。桌面应用打包、完整标准协议传输层和分布式多节点 Worker 不在当前版本范围内。

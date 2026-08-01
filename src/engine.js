@@ -10,8 +10,9 @@ const SWEEP_ORDER = ["backlog", "todo", "dev", "review", "blocked", "done"];
 const MAX_SWEEPS = 10;
 
 export class Engine {
-  constructor(store, getProviders, broadcast = () => {}) {
+  constructor(store, getProviders, broadcast = () => {}, realExecution = null) {
     this.store = store;
+    this.realExecution = realExecution;
     // getProviders() is evaluated on every run so provider config changes
     // (activate / deactivate / edit) take effect without a restart.
     this.getProviders = getProviders;
@@ -27,15 +28,18 @@ export class Engine {
     const card = this.store.getCard(cardId);
     if (!card) throw new Error(`Card not found: ${cardId}`);
     const lane = card.column_id;
-    const specialist = SPECIALISTS[lane];
-    if (!specialist) throw new Error(`No specialist for lane ${lane}`);
+    const baseSpecialist = SPECIALISTS[lane];
+    if (!baseSpecialist) throw new Error(`No specialist for lane ${lane}`);
+    const config = this.store.listSpecialistConfigs().find((c) => c.lane === lane);
+    const specialist = config ? { ...baseSpecialist, name: config.name || baseSpecialist.name, systemPrompt: config.system_prompt || baseSpecialist.systemPrompt } : baseSpecialist;
+    if (config?.enabled === 0) return { card, sessionId: null, moved: false, decision: { action: "stay", reason: `${lane} specialist is disabled` } };
 
     // Terminal-lane no-op: e.g. Done Reporter stays silent once summarized.
     if (specialist.shouldRun && !specialist.shouldRun(card)) {
       return { card, sessionId: null, moved: false, decision: { action: "stay", reason: "No-op: already reported." } };
     }
 
-    const providers = this.getProviders();
+    const providers = this.getProviders(config?.provider_id ?? null);
     const providerName = providers.primary.name;
     const sessionId = this.store.createSession({
       cardId: card.id,
@@ -76,7 +80,29 @@ export class Engine {
 
     // ── Produce artifact: LLM first (if configured), else simulated ─
     let produced = null;
-    if (providers.mode === "llm") {
+    // Dev and Review use the real coding/runtime boundary when an LLM provider is active.
+    if (this.realExecution && providers.mode === "llm" && lane === "dev") {
+      try {
+        trace("info", "启动任务级 worktree 与真实 Coding Agent Runtime。");
+        produced = await this.realExecution.executeDev({
+          card,
+          provider: providers.primary,
+          onEvent: (event) => trace("tool", `${event.tool}: ${event.type}`, event),
+          shouldCancel: () => this.store.isSessionCancelRequested(sessionId),
+        });
+      } catch (err) {
+        trace("error", `真实编码执行失败: ${err.message}`);
+        produced = {
+          artifact: { lane, specialist: specialist.name, type: "feedback", content: `## Real Execution Failure\n\n${err.message}`, data: { realExecutionFailure: true } },
+          decision: { action: "move", target: "blocked", verdict: "BLOCKED", reason: "真实编码执行失败，需要恢复或人工处理。" },
+        };
+      }
+    }
+    if (this.realExecution && lane === "review") {
+      try { produced = await this.realExecution.executeReview({ card, provider: providers.mode === "llm" ? providers.primary : null }); }
+      catch (err) { trace("error", `独立真实评审失败: ${err.message}`); }
+    }
+    if (!produced && providers.mode === "llm") {
       try {
         const { system, user } = specialist.buildPrompt(card);
         trace("info", `调用 LLM provider (${providers.primary.name})...`);
@@ -115,10 +141,17 @@ export class Engine {
     return { card: updated, sessionId, moved, decision };
   }
 
+  listRunnableCards(boardId) {
+    const cards=this.store.listCards(boardId), doneIds=new Set(cards.filter((c)=>c.column_id==="done").map((c)=>c.id));
+    return cards.filter((card)=>{
+      if(card.column_id==="done") return SPECIALISTS.done.shouldRun?.(card) ?? false;
+      return card.dependencies.every((id)=>doneIds.has(id));
+    });
+  }
+
   /**
-   * Board automation sweep: iterate lanes in order, run every card once per
-   * sweep, repeat until the board is stable. Mirrors Routa's per-board
-   * automation with queueing.
+   * Board automation sweep: iterate lanes in order, run every dependency-ready
+   * card once per sweep, repeat until the board is stable.
    */
   async runBoard(boardId) {
     if (this.boardLocks.has(boardId)) return { ok: false, error: "Board automation already running." };
@@ -130,7 +163,7 @@ export class Engine {
         summary.sweeps = sweep;
         let movedThisSweep = 0;
         for (const lane of SWEEP_ORDER) {
-          const cards = this.store.listCards(boardId).filter((c) => c.column_id === lane);
+          const cards = this.listRunnableCards(boardId).filter((c) => c.column_id === lane);
           for (const card of cards) {
             const result = await this.runCard(card.id);
             summary.runs++;

@@ -137,7 +137,10 @@
   async function renderDrawer(card) {
     $("#drawer-title").textContent = card.title;
     const laneName = state.lanes.find((l) => l.id === card.column_id)?.name ?? card.column_id;
-    $("#drawer-meta").textContent = `${laneName} · 创建于 ${new Date(card.created_at).toLocaleString()}`;
+    $("#drawer-meta").textContent = `${laneName}${card.branch_name ? ` · ⎇ ${card.branch_name}` : ""} · 创建于 ${new Date(card.created_at).toLocaleString()}`;
+    const deliverBtn=$("#deliver-card-btn");
+    deliverBtn.classList.toggle("hidden",!card.head_commit);
+    deliverBtn.textContent=card.pr_url?"↗ 打开 PR":"↑ Push & PR";
     $("#drawer-objective").textContent = card.objective || "（无目标描述）";
     $("#move-select").innerHTML =
       `<option value="">移动到…</option>` +
@@ -199,10 +202,16 @@
     state.running = true;
     const btn = $("#run-board-btn");
     btn.disabled = true;
-    btn.textContent = "⏳ Automation 运行中…";
+    btn.textContent = "⏳ 已进入持久化队列…";
     try {
-      const result = await api(`/api/boards/${state.board.id}/run`, { method: "POST" });
-      toast(`Automation 完成：${result.sweeps} 轮 sweep，${result.runs} 次 specialist 运行，${result.moves} 次移动。`);
+      let job = await api(`/api/boards/${state.board.id}/run`, { method: "POST", body:{async:true} });
+      while (["PENDING","RUNNING"].includes(job.status)) {
+        await new Promise((r)=>setTimeout(r,500));
+        job=await api(`/api/jobs/${job.id}`);
+        btn.textContent=`⏳ Automation ${job.status} · attempt ${job.attempts}`;
+      }
+      if(job.status!=="COMPLETED") throw new Error(job.error||job.status);
+      toast("Automation 已由持久化 Worker 完成；服务重启时也可恢复未完成任务。");
     } catch (err) {
       toast(`Automation 失败：${err.message}`);
     } finally {
@@ -222,6 +231,13 @@
     } catch (err) {
       toast(`运行失败：${err.message}`);
     }
+  });
+
+  $("#deliver-card-btn").addEventListener("click",async()=>{
+    const card=state.cards.find((c)=>c.id===state.openCardId);if(!card)return;
+    if(card.pr_url){window.open(card.pr_url,"_blank");return;}
+    try{const r=await api(`/api/cards/${card.id}/deliver`,{method:"POST",body:{title:card.title,body:card.objective}});toast(r.pr?`PR #${r.pr.number} 已创建`:r.note);await loadState();}
+    catch(err){toast(`交付失败：${err.message}`,5000);}
   });
 
   $("#move-select").addEventListener("change", async (e) => {

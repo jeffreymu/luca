@@ -9,6 +9,9 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDb, Store } from "./src/db.js";
 import { Engine } from "./src/engine.js";
+import { RealExecutionService } from "./src/real-execution.js";
+import { DurableWorker } from "./src/job-worker.js";
+import { handlePlatformApi } from "./src/platform-api.js";
 import { gitStatus, gitPull, gitPush } from "./src/git.js";
 import { parseGitHubSlug, createPullRequest } from "./src/github.js";
 import {
@@ -39,13 +42,15 @@ export function createApp({ dbPath = "luca.db" } = {}) {
     const payload = `data: ${JSON.stringify(event)}\n\n`;
     for (const res of sseClients) res.write(payload);
   };
-  const engine = new Engine(store, () => {
-    const active = store.getActiveProvider();
+  const engine = new Engine(store, (providerId = null) => {
+    const active = providerId ? store.getProvider(providerId) : store.getActiveProvider();
     if (active) {
       return { primary: providerFromRow(active), fallback: new SimulatedProvider(), mode: "llm", source: "db" };
     }
     return resolveProvider(); // env vars, else simulated
-  }, broadcast);
+  }, broadcast, new RealExecutionService(store));
+  const worker = new DurableWorker({ store, engine, broadcast });
+  worker.start();
 
   const providerInfo = () => {
     const p = engine.getProviders();
@@ -91,6 +96,7 @@ export function createApp({ dbPath = "luca.db" } = {}) {
   async function readBody(req) {
     let raw = "";
     for await (const chunk of req) raw += chunk;
+    req.rawBody = raw;
     if (!raw) return {};
     try {
       return JSON.parse(raw);
@@ -119,6 +125,9 @@ export function createApp({ dbPath = "luca.db" } = {}) {
       }
 
       // ── API ────────────────────────────────────────────────────
+      if (path === "/api/health" && method === "GET") {
+        return json(res, 200, { ok: true, database: "sqlite", worker: { active: worker.active, maxConcurrency: worker.maxConcurrency }, now: new Date().toISOString() });
+      }
       if (path === "/api/state" && method === "GET") {
         const workspaces = store.listWorkspaces();
         let workspaceId = url.searchParams.get("workspaceId") ?? workspaces[0]?.id;
@@ -142,6 +151,9 @@ export function createApp({ dbPath = "luca.db" } = {}) {
           provider: providerInfo(),
         });
       }
+
+      // ── Extended platform APIs: durable jobs, workflows, skills, MCP, repository intelligence ──
+      if (await handlePlatformApi({ req, res, url, store, engine, worker, json, badRequest, notFound, readBody, broadcast })) return;
 
       // ── Provider management ────────────────────────────────────
       if (path === "/api/providers" && method === "GET") {
@@ -246,6 +258,8 @@ export function createApp({ dbPath = "luca.db" } = {}) {
           githubToken: body.githubToken?.trim() || undefined,
           githubRepo: body.githubRepo !== undefined ? String(body.githubRepo).trim() || null : undefined,
           githubApiBase: body.githubApiBase !== undefined ? String(body.githubApiBase).trim() || null : undefined,
+          validationCommands: body.validationCommands,
+          sandboxPolicy: body.sandboxPolicy,
         });
         if (!updated) return notFound(res);
         broadcast({ type: "workspace" });
@@ -318,6 +332,11 @@ export function createApp({ dbPath = "luca.db" } = {}) {
           boardId: boardCardsMatch[1],
           title: body.title.trim(),
           objective: body.objective ?? "",
+          parentId: body.parentId ?? null,
+          dependencies: body.dependencies ?? [],
+          priority: body.priority ?? 0,
+          assignee: body.assignee ?? null,
+          tags: body.tags ?? [],
         });
         broadcast({ type: "card", cardId: card.id, boardId: card.board_id });
         return json(res, 201, card);
@@ -325,6 +344,12 @@ export function createApp({ dbPath = "luca.db" } = {}) {
 
       const boardRunMatch = path.match(/^\/api\/boards\/([^/]+)\/run$/);
       if (boardRunMatch && method === "POST") {
+        const body = await readBody(req);
+        if (body.async === true) {
+          const board=store.getBoard(boardRunMatch[1]);
+          const job=store.createJob({type:"board.run",workspaceId:board?.workspace_id,boardId:boardRunMatch[1],payload:{source:"api"}});
+          return json(res,202,job);
+        }
         const result = await engine.runBoard(boardRunMatch[1]);
         return json(res, result.ok === false ? 409 : 200, result);
       }
@@ -339,6 +364,10 @@ export function createApp({ dbPath = "luca.db" } = {}) {
           const updated = store.updateCard(card.id, {
             title: body.title?.trim() || undefined,
             objective: body.objective !== undefined ? String(body.objective) : undefined,
+            dependencies: body.dependencies,
+            priority: body.priority,
+            assignee: body.assignee,
+            tags: body.tags,
           });
           broadcast({ type: "card", cardId: card.id, boardId: card.board_id });
           return json(res, 200, updated);
@@ -403,16 +432,18 @@ export function createApp({ dbPath = "luca.db" } = {}) {
     }
   });
 
-  return { server, store, engine };
+  server.on("close", () => worker.stop());
+  return { server, store, engine, worker };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const port = Number(process.env.PORT ?? 3210);
+  const host = process.env.HOST ?? "127.0.0.1"; // tool/file APIs are local-only by default
   const dbPath = process.env.LUCA_DB ?? "luca.db";
   const { server, engine } = createApp({ dbPath });
-  server.listen(port, () => {
-    console.log(`\n  ◆ Luca — workspace-first multi-agent delivery board`);
-    console.log(`  ◆ http://localhost:${port}`);
+  server.listen(port, host, () => {
+    console.log(`\n  ◆ LucaPi — workspace-first multi-agent delivery board`);
+    console.log(`  ◆ http://${host}:${port}`);
     console.log(`  ◆ provider: ${engine.getProviders().mode === "llm" ? engine.getProviders().primary.name : "simulated (configure one in ⚙ Providers, or set LUCA_LLM_BASE_URL/API_KEY/MODEL)"}`);
     console.log(`  ◆ db: ${dbPath}\n`);
   });

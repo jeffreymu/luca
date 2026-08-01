@@ -32,6 +32,24 @@ export class OpenAIProvider {
     return this.label ? `${this.label} (${this.model})` : `openai:${this.model}`;
   }
 
+  async chat({ messages, tools, toolChoice = "auto", timeoutMs = 120_000 }) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${this.apiKey}` },
+        body: JSON.stringify({ model: this.model, temperature: 0.1, messages, tools, tool_choice: tools?.length ? toolChoice : undefined }),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      const body = await res.json();
+      const message = body.choices?.[0]?.message;
+      if (!message) throw new Error("LLM returned no message");
+      return message;
+    } finally { clearTimeout(timer); }
+  }
+
   async complete({ system, user, timeoutMs = 60_000 }) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);

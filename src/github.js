@@ -36,6 +36,24 @@ async function ghFetch(apiBase, path, { token, method = "GET", body } = {}) {
  * Create a pull request. If one already exists for the head branch
  * (GitHub answers 422), look it up and return it instead of failing.
  */
+export async function listIssues({apiBase,token,slug,state="open"}) {
+  const r=await ghFetch(apiBase,`/repos/${slug}/issues?state=${encodeURIComponent(state)}`,{token});
+  if(r.status!==200) throw new Error(`GitHub issues HTTP ${r.status}: ${r.json?.message??r.text}`);
+  return r.json.filter((item)=>!item.pull_request);
+}
+
+export async function listPullRequests({apiBase,token,slug,state="open"}) {
+  const r=await ghFetch(apiBase,`/repos/${slug}/pulls?state=${encodeURIComponent(state)}`,{token});
+  if(r.status!==200) throw new Error(`GitHub pulls HTTP ${r.status}: ${r.json?.message??r.text}`);
+  return r.json;
+}
+
+export async function postPullRequestComment({apiBase,token,slug,number,body}) {
+  const r=await ghFetch(apiBase,`/repos/${slug}/issues/${number}/comments`,{token,method:"POST",body:{body}});
+  if(r.status!==201) throw new Error(`GitHub comment HTTP ${r.status}: ${r.json?.message??r.text}`);
+  return r.json;
+}
+
 export async function createPullRequest({ apiBase, token, slug, title, body, head, base }) {
   const created = await ghFetch(apiBase, `/repos/${slug}/pulls`, {
     token,
