@@ -3,10 +3,11 @@ import { readFile, access } from "node:fs/promises";
 import path from "node:path";
 import { runGit } from "./git.js";
 
-function exec(command, args, cwd, timeoutMs = 120_000) {
+function exec(command, args, cwd, timeoutMs = 120_000, containerId = null, signal = null) {
   return new Promise((resolve) => {
     const started = Date.now();
-    execFile(command, args, { cwd, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+    const executable=containerId?"docker":command,commandArgs=containerId?["exec","--workdir","/workspace",containerId,command,...args]:args;
+    execFile(executable, commandArgs, { cwd, timeout: timeoutMs, signal, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
       resolve({
         command: [command, ...args].join(" "),
         exitCode: error?.code && Number.isInteger(error.code) ? error.code : error ? 1 : 0,
@@ -49,12 +50,15 @@ export async function detectValidationCommands(repoPath) {
   return [];
 }
 
-export async function runValidation(repoPath, commands = []) {
+export async function runValidation(repoPath, commands = [], {containerId=null,shouldCancel=()=>false} = {}) {
   const results = [];
   for (const item of commands) {
+    if(shouldCancel())throw new Error("Validation cancelled by operator");
     const [command, ...args] = Array.isArray(item) ? item : String(item).trim().split(/\s+/);
     if (!command) continue;
-    results.push(await exec(command, args, repoPath));
+    const controller=new AbortController(),timer=setInterval(()=>{if(shouldCancel())controller.abort();},100);timer.unref?.();
+    try{results.push(await exec(command,args,repoPath,120_000,containerId,controller.signal));}finally{clearInterval(timer);}
+    if(shouldCancel())throw new Error("Validation cancelled by operator");
   }
   return results;
 }

@@ -1,5 +1,5 @@
 /**
- * Luca lane specialists — adapted from Routa's kanban lane contracts
+ * LucaPi lane specialists — contract-driven autonomous delivery roles
  * (resources/specialists/workflows/kanban/*.yaml).
  *
  * Each specialist owns one lane and follows the same protocol:
@@ -374,7 +374,7 @@ const devCrafter = {
 
 // ── 4. Review Guard ─────────────────────────────────────────────────
 
-const MAX_REVIEW_REJECTIONS = 3; // loop breaker, mirrors Routa's loopBreakerThreshold
+const MAX_REVIEW_REJECTIONS = 3; // bounded review loop breaker
 
 const reviewGuard = {
   id: "review-guard",

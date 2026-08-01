@@ -1,17 +1,26 @@
 /**
- * Luca persistence layer — node:sqlite (zero dependencies).
- *
- * Entities (borrowed from Routa's workspace-first model):
- *   workspaces -> boards -> cards (with growing artifacts)
- *   sessions + traces (every specialist run is auditable)
+ * LucaPi persistence layer — node:sqlite (zero dependencies).
+ * Workspaces own boards, cards, auditable sessions, durable jobs and platform configuration.
  */
 import { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
+import { nextCronDate } from "./scheduler.js";
+import { createCipheriv, createDecipheriv, randomBytes, randomUUID, scryptSync } from "node:crypto";
 
-export function openDb(dbPath = "luca.db") {
+class SecretCodec {
+  constructor(secret) { this.key=secret?scryptSync(secret,"lucapi-local-secrets",32):null;this.enabled=Boolean(this.key); }
+  encode(value) { if(!value||!this.key||String(value).startsWith("enc:v1:"))return value;const iv=randomBytes(12),cipher=createCipheriv("aes-256-gcm",this.key,iv),encrypted=Buffer.concat([cipher.update(String(value),"utf8"),cipher.final()]);return`enc:v1:${iv.toString("base64")}:${cipher.getAuthTag().toString("base64")}:${encrypted.toString("base64")}`; }
+  decode(value) { if(!value||!String(value).startsWith("enc:v1:"))return value;if(!this.key)throw new Error("Encrypted secret requires LUCAPI_SECRET_KEY");const[, ,iv,tag,data]=String(value).split(":"),decipher=createDecipheriv("aes-256-gcm",this.key,Buffer.from(iv,"base64"));decipher.setAuthTag(Buffer.from(tag,"base64"));return Buffer.concat([decipher.update(Buffer.from(data,"base64")),decipher.final()]).toString("utf8"); }
+}
+
+export function openDb(dbPath = "lucapi.db") {
   const db = new DatabaseSync(dbPath);
   db.exec(`
     PRAGMA journal_mode = WAL;
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      applied_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS workspaces (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -116,6 +125,20 @@ export function openDb(dbPath = "luca.db") {
       last_run_at TEXT,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS execution_leases (
+      resource_type TEXT NOT NULL,
+      resource_id TEXT NOT NULL,
+      worker_id TEXT NOT NULL,
+      lease_until TEXT NOT NULL,
+      PRIMARY KEY(resource_type, resource_id)
+    );
+    CREATE TABLE IF NOT EXISTS schedule_runs (
+      id TEXT PRIMARY KEY,
+      schedule_id TEXT NOT NULL,
+      job_id TEXT,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS skills (
       id TEXT PRIMARY KEY,
       workspace_id TEXT,
@@ -175,6 +198,18 @@ export function openDb(dbPath = "luca.db") {
       content TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS operation_approvals (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      resource_id TEXT,
+      payload TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      response TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      consumed_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS approvals (
       id TEXT PRIMARY KEY,
       team_run_id TEXT NOT NULL,
@@ -208,13 +243,26 @@ export function openDb(dbPath = "luca.db") {
     "ALTER TABLE cards ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE sessions ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN resumed_from TEXT",
+    "ALTER TABLE sessions ADD COLUMN agent_id TEXT",
+    "ALTER TABLE team_runs ADD COLUMN approval_required INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN worker_id TEXT",
+    "ALTER TABLE webhook_configs ADD COLUMN filters TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE schedules ADD COLUMN concurrency_policy TEXT NOT NULL DEFAULT 'FORBID'",
+    "ALTER TABLE schedules ADD COLUMN cron_expression TEXT",
+    "ALTER TABLE schedules ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'",
+    "ALTER TABLE schedules ADD COLUMN lease_until TEXT",
+    "ALTER TABLE schedules ADD COLUMN worker_id TEXT",
   ]) {
     try {
       db.exec(ddl);
-    } catch {
-      /* column already exists */
+    } catch (err) {
+      if(!String(err.message).includes("duplicate column name"))throw err;
     }
   }
+  db.prepare("INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)").run(1,"initial-schema",new Date().toISOString());
+  db.prepare("INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)").run(2,"autonomous-platform-hardening",new Date().toISOString());
+  db.prepare("INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)").run(3,"production-hardening",new Date().toISOString());
+  db.exec("PRAGMA user_version = 3");
   return db;
 }
 
@@ -238,9 +286,18 @@ function parseJsonColumns(row, columns) {
 }
 
 export class Store {
-  constructor(db) {
+  constructor(db, {secretKey=process.env.LUCAPI_SECRET_KEY} = {}) {
     this.db = db;
+    this.secrets = new SecretCodec(secretKey);
+    if(this.secrets.enabled){
+      for(const row of db.prepare("SELECT id,api_key FROM providers").all())if(row.api_key&&!row.api_key.startsWith("enc:v1:"))db.prepare("UPDATE providers SET api_key=? WHERE id=?").run(this.secrets.encode(row.api_key),row.id);
+      for(const row of db.prepare("SELECT id,github_token FROM workspaces").all())if(row.github_token&&!row.github_token.startsWith("enc:v1:"))db.prepare("UPDATE workspaces SET github_token=? WHERE id=?").run(this.secrets.encode(row.github_token),row.id);
+      for(const row of db.prepare("SELECT id,secret FROM webhook_configs").all())if(row.secret&&!row.secret.startsWith("enc:v1:"))db.prepare("UPDATE webhook_configs SET secret=? WHERE id=?").run(this.secrets.encode(row.secret),row.id);
+    }
   }
+
+  schemaInfo(){return{userVersion:this.db.prepare("PRAGMA user_version").get().user_version,migrations:this.db.prepare("SELECT * FROM schema_migrations ORDER BY version").all()};}
+  backup(filePath){if(!filePath||!String(filePath).endsWith(".db"))throw new Error("backup path must end with .db");const escaped=String(filePath).replaceAll("'","''");this.db.exec(`VACUUM INTO '${escaped}'`);return{path:filePath,createdAt:now()};}
 
   // ── Workspaces / Boards ──────────────────────────────────────────
   createWorkspace({ name, repoPath }) {
@@ -256,11 +313,11 @@ export class Store {
   }
 
   listWorkspaces() {
-    return this.db.prepare("SELECT * FROM workspaces ORDER BY created_at ASC").all();
+    return this.db.prepare("SELECT * FROM workspaces ORDER BY created_at ASC").all().map((w)=>({...w,github_token:this.secrets.decode(w.github_token)}));
   }
 
   getWorkspace(id) {
-    return this.db.prepare("SELECT * FROM workspaces WHERE id = ?").get(id);
+    const w=this.db.prepare("SELECT * FROM workspaces WHERE id = ?").get(id);return w?{...w,github_token:this.secrets.decode(w.github_token)}:w;
   }
 
   updateWorkspace(id, patch) {
@@ -274,7 +331,7 @@ export class Store {
         patch.name ?? row.name,
         patch.repoPath !== undefined ? patch.repoPath : row.repo_path,
         // empty string keeps the stored token; there is no "clear" via PATCH
-        patch.githubToken ? patch.githubToken : row.github_token,
+        this.secrets.encode(patch.githubToken ? patch.githubToken : row.github_token),
         patch.githubRepo !== undefined ? patch.githubRepo : row.github_repo,
         patch.githubApiBase !== undefined ? patch.githubApiBase : row.github_api_base,
         patch.validationCommands !== undefined ? JSON.stringify(patch.validationCommands) : row.validation_commands,
@@ -295,17 +352,20 @@ export class Store {
   }
 
   getWorkspaceByBoard(boardId) {
-    return this.db.prepare("SELECT w.* FROM workspaces w JOIN boards b ON b.workspace_id=w.id WHERE b.id=?").get(boardId);
+    const w=this.db.prepare("SELECT w.* FROM workspaces w JOIN boards b ON b.workspace_id=w.id WHERE b.id=?").get(boardId);return w?{...w,github_token:this.secrets.decode(w.github_token)}:w;
   }
 
   deleteWorkspace(id) {
-    const boards = this.db.prepare("SELECT id FROM boards WHERE workspace_id = ?").all(id);
-    for (const b of boards) {
-      const cards = this.db.prepare("SELECT id FROM cards WHERE board_id = ?").all(b.id);
-      for (const c of cards) this.deleteCard(c.id);
-      this.db.prepare("DELETE FROM boards WHERE id = ?").run(b.id);
-    }
-    this.db.prepare("DELETE FROM workspaces WHERE id = ?").run(id);
+    this.db.exec("BEGIN IMMEDIATE");
+    try{
+      const boards=this.db.prepare("SELECT id FROM boards WHERE workspace_id=?").all(id);
+      for(const b of boards){for(const c of this.db.prepare("SELECT id FROM cards WHERE board_id=?").all(b.id))this.deleteCard(c.id);this.db.prepare("DELETE FROM boards WHERE id=?").run(b.id);}
+      for(const hook of this.db.prepare("SELECT id FROM webhook_configs WHERE workspace_id=?").all(id))this.db.prepare("DELETE FROM webhook_logs WHERE config_id=?").run(hook.id);
+      for(const run of this.db.prepare("SELECT id FROM team_runs WHERE workspace_id=?").all(id)){this.db.prepare("DELETE FROM team_messages WHERE team_run_id=?").run(run.id);this.db.prepare("DELETE FROM approvals WHERE team_run_id=?").run(run.id);}
+      for(const schedule of this.db.prepare("SELECT id FROM schedules WHERE workspace_id=?").all(id))this.db.prepare("DELETE FROM schedule_runs WHERE schedule_id=?").run(schedule.id);
+      for(const table of ["jobs","workflows","schedules","skills","webhook_configs","agents","team_runs","operation_approvals"])this.db.prepare(`DELETE FROM ${table} WHERE workspace_id=?`).run(id);
+      this.db.prepare("DELETE FROM workspaces WHERE id=?").run(id);this.db.exec("COMMIT");
+    }catch(err){this.db.exec("ROLLBACK");throw err;}
   }
 
   // ── Cards ────────────────────────────────────────────────────────
@@ -396,6 +456,8 @@ export class Store {
   }
 
   deleteCard(id) {
+    const card=this.getCard(id);
+    if(card)for(const dependent of this.listCards(card.board_id).filter((c)=>c.id!==id&&c.dependencies.includes(id)))this.updateCard(dependent.id,{dependencies:dependent.dependencies.filter((dependency)=>dependency!==id)});
     const sessions = this.db.prepare("SELECT id FROM sessions WHERE card_id = ?").all(id);
     for (const s of sessions) this.db.prepare("DELETE FROM traces WHERE session_id = ?").run(s.id);
     this.db.prepare("DELETE FROM sessions WHERE card_id = ?").run(id);
@@ -437,14 +499,14 @@ export class Store {
       .run(now(), now());
   }
 
-  claimJob(leaseMs = 120_000) {
+  claimJob(leaseMs = 120_000, workerId = null) {
     this.recoverExpiredJobs();
     const timestamp=now(), leaseUntil = new Date(Date.now() + leaseMs).toISOString();
     const row=this.db.prepare(
-      `UPDATE jobs SET status='RUNNING',attempts=attempts+1,lease_until=?,updated_at=?
+      `UPDATE jobs SET status='RUNNING',attempts=attempts+1,lease_until=?,updated_at=?,worker_id=?
        WHERE id=(SELECT id FROM jobs WHERE status='PENDING' AND run_after<=? ORDER BY priority DESC,created_at ASC LIMIT 1)
        AND status='PENDING' RETURNING *`
-    ).get(leaseUntil,timestamp,timestamp);
+    ).get(leaseUntil,timestamp,workerId,timestamp);
     return parseJsonColumns(row,["payload"]);
   }
 
@@ -468,6 +530,8 @@ export class Store {
     return retry;
   }
 
+  retryJob(id) { const job=this.getJob(id);if(!job||!["FAILED","CANCELLED"].includes(job.status))return null;this.db.prepare("UPDATE jobs SET status='PENDING',error=NULL,attempts=0,run_after=?,lease_until=NULL,worker_id=NULL,updated_at=? WHERE id=?").run(now(),now(),id);return this.getJob(id); }
+  releaseJobLease(id,{delayMs=0,refundAttempt=false}={}) { this.db.prepare(`UPDATE jobs SET status='PENDING',lease_until=NULL,worker_id=NULL,run_after=?,attempts=MAX(0,attempts-?),updated_at=? WHERE id=? AND status='RUNNING'`).run(new Date(Date.now()+delayMs).toISOString(),refundAttempt?1:0,now(),id);return this.getJob(id); }
   cancelJob(id) {
     const job=this.getJob(id);
     this.db.prepare("UPDATE jobs SET status='CANCELLED', lease_until=NULL, updated_at=? WHERE id=? AND status IN ('PENDING','RUNNING')")
@@ -475,6 +539,10 @@ export class Store {
     if(job?.card_id) this.db.prepare("UPDATE sessions SET cancel_requested=1 WHERE card_id=? AND status='ACTIVE'").run(job.card_id);
     return this.getJob(id);
   }
+
+  acquireExecutionLease(resourceType,resourceId,workerId,leaseMs=120_000){const until=new Date(Date.now()+leaseMs).toISOString(),timestamp=now();return this.db.prepare(`INSERT INTO execution_leases VALUES (?,?,?,?) ON CONFLICT(resource_type,resource_id) DO UPDATE SET worker_id=excluded.worker_id,lease_until=excluded.lease_until WHERE execution_leases.lease_until<? RETURNING *`).get(resourceType,resourceId,workerId,until,timestamp);}
+  renewExecutionLease(resourceType,resourceId,workerId,leaseMs=120_000){return this.db.prepare("UPDATE execution_leases SET lease_until=? WHERE resource_type=? AND resource_id=? AND worker_id=?").run(new Date(Date.now()+leaseMs).toISOString(),resourceType,resourceId,workerId).changes===1;}
+  releaseExecutionLease(resourceType,resourceId,workerId){this.db.prepare("DELETE FROM execution_leases WHERE resource_type=? AND resource_id=? AND worker_id=?").run(resourceType,resourceId,workerId);}
 
   // ── Configurable specialists ────────────────────────────────────
   listSpecialistConfigs() { return this.db.prepare("SELECT * FROM specialist_configs ORDER BY lane").all(); }
@@ -497,17 +565,25 @@ export class Store {
   }
   getWorkflow(id) { return parseJsonColumns(this.db.prepare("SELECT * FROM workflows WHERE id=?").get(id), ["definition"]); }
   listWorkflows(workspaceId) { return this.db.prepare("SELECT * FROM workflows WHERE workspace_id=? ORDER BY created_at").all(workspaceId).map((r) => parseJsonColumns(r,["definition"])); }
+  updateWorkflow(id,patch){const w=this.getWorkflow(id);if(!w)return null;this.db.prepare("UPDATE workflows SET name=?,definition=?,updated_at=? WHERE id=?").run(patch.name??w.name,JSON.stringify(patch.definition??w.definition),now(),id);return this.getWorkflow(id);}
   deleteWorkflow(id) { this.db.prepare("DELETE FROM workflows WHERE id=?").run(id); }
 
-  createSchedule({ workspaceId, workflowId, name, intervalMinutes }) {
-    const id = randomUUID();
-    const next = new Date(Date.now() + intervalMinutes * 60_000).toISOString();
-    this.db.prepare("INSERT INTO schedules VALUES (?,?,?,?,?,1,?,?,?)").run(id, workspaceId, workflowId, name, intervalMinutes, next, null, now());
-    return this.db.prepare("SELECT * FROM schedules WHERE id=?").get(id);
+  createSchedule({ workspaceId, workflowId, name, intervalMinutes = 0, cronExpression = null, timezone = "UTC", concurrencyPolicy = "FORBID" }) {
+    const id=randomUUID(),next=(cronExpression?nextCronDate(cronExpression,timezone):new Date(Date.now()+intervalMinutes*60_000)).toISOString();
+    this.db.prepare("INSERT INTO schedules (id,workspace_id,workflow_id,name,interval_minutes,enabled,next_run_at,last_run_at,created_at,concurrency_policy,cron_expression,timezone) VALUES (?,?,?,?,?,1,?,?,?, ?,?,?)").run(id,workspaceId,workflowId,name,intervalMinutes,next,null,now(),concurrencyPolicy,cronExpression,timezone);
+    return this.getSchedule(id);
   }
+  getSchedule(id){return this.db.prepare("SELECT * FROM schedules WHERE id=?").get(id);}
   listSchedules(workspaceId) { return this.db.prepare("SELECT * FROM schedules WHERE workspace_id=? ORDER BY created_at").all(workspaceId); }
-  dueSchedules() { return this.db.prepare("SELECT * FROM schedules WHERE enabled=1 AND next_run_at <= ?").all(now()); }
-  markScheduleRun(id, intervalMinutes) { this.db.prepare("UPDATE schedules SET last_run_at=?, next_run_at=? WHERE id=?").run(now(), new Date(Date.now()+intervalMinutes*60_000).toISOString(), id); }
+  dueSchedules() { return this.db.prepare("SELECT * FROM schedules WHERE enabled=1 AND next_run_at <= ? AND (lease_until IS NULL OR lease_until < ?)").all(now(),now()); }
+  claimDueSchedule(workerId,leaseMs=120_000){const timestamp=now(),leaseUntil=new Date(Date.now()+leaseMs).toISOString();return this.db.prepare(`UPDATE schedules SET lease_until=?,worker_id=? WHERE id=(SELECT id FROM schedules WHERE enabled=1 AND next_run_at<=? AND (lease_until IS NULL OR lease_until<?) ORDER BY next_run_at LIMIT 1) AND (lease_until IS NULL OR lease_until<?) RETURNING *`).get(leaseUntil,workerId,timestamp,timestamp,timestamp);}
+  updateSchedule(id,patch){const s=this.getSchedule(id);if(!s)return null;const enabled=patch.enabled===undefined?s.enabled:patch.enabled?1:0,cron=patch.cronExpression===undefined?s.cron_expression:patch.cronExpression,timezone=patch.timezone??s.timezone,interval=patch.intervalMinutes??s.interval_minutes,next=enabled?(cron?nextCronDate(cron,timezone).toISOString():new Date(Date.now()+interval*60_000).toISOString()):s.next_run_at;this.db.prepare("UPDATE schedules SET name=?,interval_minutes=?,enabled=?,next_run_at=?,concurrency_policy=?,cron_expression=?,timezone=? WHERE id=?").run(patch.name??s.name,interval,enabled,next,patch.concurrencyPolicy??s.concurrency_policy,cron,timezone,id);return this.getSchedule(id);}
+  deleteSchedule(id){this.db.prepare("DELETE FROM schedules WHERE id=?").run(id);}
+  markScheduleRun(id) { const s=this.getSchedule(id),next=s.cron_expression?nextCronDate(s.cron_expression,s.timezone).toISOString():new Date(Date.now()+s.interval_minutes*60_000).toISOString();this.db.prepare("UPDATE schedules SET last_run_at=?,next_run_at=?,lease_until=NULL,worker_id=NULL WHERE id=?").run(now(),next,id); }
+  activeScheduleJobs(id){return this.db.prepare("SELECT * FROM jobs WHERE status IN ('PENDING','RUNNING') AND json_extract(payload,'$.scheduleId')=?").all(id).map((r)=>parseJsonColumns(r,["payload"]));}
+  logScheduleRun(scheduleId,jobId,status){const id=randomUUID();this.db.prepare("INSERT INTO schedule_runs VALUES (?,?,?,?,?)").run(id,scheduleId,jobId,status,now());return id;}
+  updateScheduleRunByJob(jobId,status){this.db.prepare("UPDATE schedule_runs SET status=? WHERE job_id=?").run(status,jobId);}
+  listScheduleRuns(scheduleId){return this.db.prepare("SELECT * FROM schedule_runs WHERE schedule_id=? ORDER BY created_at DESC LIMIT 100").all(scheduleId);}
 
   createSkill({ workspaceId = null, name, description = "", instructions, tools = [] }) {
     const id = randomUUID();
@@ -515,18 +591,23 @@ export class Store {
     return parseJsonColumns(this.db.prepare("SELECT * FROM skills WHERE id=?").get(id), ["tools"]);
   }
   listSkills(workspaceId) { return this.db.prepare("SELECT * FROM skills WHERE workspace_id IS NULL OR workspace_id=? ORDER BY name").all(workspaceId).map((r)=>parseJsonColumns(r,["tools"])); }
+  updateSkill(id,patch){const s=parseJsonColumns(this.db.prepare("SELECT * FROM skills WHERE id=?").get(id),["tools"]);if(!s)return null;this.db.prepare("UPDATE skills SET name=?,description=?,instructions=?,tools=?,updated_at=? WHERE id=?").run(patch.name??s.name,patch.description??s.description,patch.instructions??s.instructions,JSON.stringify(patch.tools??s.tools),now(),id);return parseJsonColumns(this.db.prepare("SELECT * FROM skills WHERE id=?").get(id),["tools"]);}
   deleteSkill(id) { this.db.prepare("DELETE FROM skills WHERE id=?").run(id); }
 
-  createWebhook({ workspaceId, workflowId, event, secret = null }) {
+  createWebhook({ workspaceId, workflowId, event, secret = null, filters = {} }) {
     const id = randomUUID();
-    this.db.prepare("INSERT INTO webhook_configs VALUES (?,?,?,?,?,1,?)").run(id, workspaceId, workflowId, event, secret, now());
-    return this.db.prepare("SELECT * FROM webhook_configs WHERE id=?").get(id);
+    this.db.prepare("INSERT INTO webhook_configs (id,workspace_id,workflow_id,event,secret,enabled,created_at,filters) VALUES (?,?,?,?,?,1,?,?)").run(id, workspaceId, workflowId, event, this.secrets.encode(secret), now(),JSON.stringify(filters));
+    return {...this.db.prepare("SELECT * FROM webhook_configs WHERE id=?").get(id),secret,filters};
   }
-  listWebhooks(workspaceId) { return this.db.prepare("SELECT * FROM webhook_configs WHERE workspace_id=? ORDER BY created_at").all(workspaceId); }
-  matchingWebhooks(workspaceId, event) { return this.db.prepare("SELECT * FROM webhook_configs WHERE workspace_id=? AND event=? AND enabled=1").all(workspaceId,event); }
+  getWebhook(id){const c=this.db.prepare("SELECT * FROM webhook_configs WHERE id=?").get(id);return c?{...c,secret:this.secrets.decode(c.secret),filters:JSON.parse(c.filters||"{}")} : null;}
+  listWebhooks(workspaceId) { return this.db.prepare("SELECT * FROM webhook_configs WHERE workspace_id=? ORDER BY created_at").all(workspaceId).map((c)=>({...c,secret:this.secrets.decode(c.secret),filters:JSON.parse(c.filters||"{}")})); }
+  updateWebhook(id,patch){const c=this.getWebhook(id);if(!c)return null;this.db.prepare("UPDATE webhook_configs SET workflow_id=?,event=?,secret=?,enabled=?,filters=? WHERE id=?").run(patch.workflowId??c.workflow_id,patch.event??c.event,this.secrets.encode(patch.secret||c.secret),patch.enabled===undefined?c.enabled:patch.enabled?1:0,JSON.stringify(patch.filters??c.filters),id);return this.getWebhook(id);}
+  matchingWebhooks(workspaceId, event) { return this.db.prepare("SELECT * FROM webhook_configs WHERE workspace_id=? AND event=? AND enabled=1").all(workspaceId,event).map((c)=>({...c,secret:this.secrets.decode(c.secret),filters:JSON.parse(c.filters||"{}")})); }
   logWebhook({ configId, event, deliveryId, status, payload, error = null }) {
     const id=randomUUID(); this.db.prepare("INSERT INTO webhook_logs VALUES (?,?,?,?,?,?,?,?)").run(id,configId,event,deliveryId,status,JSON.stringify(payload),error,now()); return id;
   }
+  hasAcceptedWebhook(configId,deliveryId){return Boolean(deliveryId&&this.db.prepare("SELECT 1 FROM webhook_logs WHERE config_id=? AND delivery_id=? AND status='ACCEPTED'").get(configId,deliveryId));}
+  listWebhookLogs(workspaceId,limit=100){return this.db.prepare("SELECT l.* FROM webhook_logs l JOIN webhook_configs c ON c.id=l.config_id WHERE c.workspace_id=? ORDER BY l.created_at DESC LIMIT ?").all(workspaceId,limit).map((l)=>({...l,payload:JSON.parse(l.payload||"{}")}));}
 
   // ── Multi-agent team coordination ──────────────────────────────
   createAgent({ workspaceId, name, role, providerId = null, parentId = null, metadata = {} }) {
@@ -535,14 +616,23 @@ export class Store {
   getAgent(id) { return parseJsonColumns(this.db.prepare("SELECT * FROM agents WHERE id=?").get(id),["metadata"]); }
   listAgents(workspaceId) { return this.db.prepare("SELECT * FROM agents WHERE workspace_id=? ORDER BY created_at").all(workspaceId).map((r)=>parseJsonColumns(r,["metadata"])); }
   updateAgentStatus(id,status) { this.db.prepare("UPDATE agents SET status=?,updated_at=? WHERE id=?").run(status,now(),id); return this.getAgent(id); }
+  updateAgent(id,patch) { const a=this.getAgent(id);if(!a)return null;this.db.prepare("UPDATE agents SET name=?,role=?,provider_id=?,parent_id=?,metadata=?,updated_at=? WHERE id=?").run(patch.name??a.name,patch.role??a.role,patch.providerId!==undefined?patch.providerId:a.provider_id,patch.parentId!==undefined?patch.parentId:a.parent_id,JSON.stringify(patch.metadata??a.metadata),now(),id);return this.getAgent(id); }
   deleteAgent(id) { this.db.prepare("DELETE FROM agents WHERE id=?").run(id); }
-  createTeamRun({workspaceId,boardId,goal,maxConcurrency=2}) { const id=randomUUID();this.db.prepare("INSERT INTO team_runs VALUES (?,?,?,?,'PENDING',?,?,?)").run(id,workspaceId,boardId,goal,maxConcurrency,now(),now());return this.getTeamRun(id); }
+  createTeamRun({workspaceId,boardId,goal,maxConcurrency=2,approvalRequired=false}) { const id=randomUUID();this.db.prepare("INSERT INTO team_runs (id,workspace_id,board_id,goal,status,max_concurrency,created_at,updated_at,approval_required) VALUES (?,?,?,?,'PENDING',?,?,?,?)").run(id,workspaceId,boardId,goal,maxConcurrency,now(),now(),approvalRequired?1:0);return this.getTeamRun(id); }
   updateTeamRunStatus(id,status) { this.db.prepare("UPDATE team_runs SET status=?,updated_at=? WHERE id=?").run(status,now(),id); return this.getTeamRun(id); }
   getTeamRun(id) { const run=this.db.prepare("SELECT * FROM team_runs WHERE id=?").get(id);if(!run)return null;return {...run,messages:this.db.prepare("SELECT * FROM team_messages WHERE team_run_id=? ORDER BY created_at").all(id),approvals:this.db.prepare("SELECT * FROM approvals WHERE team_run_id=? ORDER BY created_at").all(id)}; }
   listTeamRuns(workspaceId) { return this.db.prepare("SELECT * FROM team_runs WHERE workspace_id=? ORDER BY created_at DESC").all(workspaceId); }
   addTeamMessage({teamRunId,agentId=null,role,content}) { const id=randomUUID();this.db.prepare("INSERT INTO team_messages VALUES (?,?,?,?,?,?)").run(id,teamRunId,agentId,role,content,now());return this.db.prepare("SELECT * FROM team_messages WHERE id=?").get(id); }
-  createApproval({teamRunId,prompt}) { const id=randomUUID();this.db.prepare("INSERT INTO approvals VALUES (?,?,?,'PENDING',NULL,?,?)").run(id,teamRunId,prompt,now(),now());return this.db.prepare("SELECT * FROM approvals WHERE id=?").get(id); }
-  resolveApproval(id,status,response="") { this.db.prepare("UPDATE approvals SET status=?,response=?,updated_at=? WHERE id=?").run(status,response,now(),id);return this.db.prepare("SELECT * FROM approvals WHERE id=?").get(id); }
+  createApproval({teamRunId,prompt}) { const id=randomUUID();this.db.prepare("INSERT INTO approvals VALUES (?,?,?,'PENDING',NULL,?,?)").run(id,teamRunId,prompt,now(),now());return this.getApproval(id); }
+  getApproval(id) { return this.db.prepare("SELECT * FROM approvals WHERE id=?").get(id); }
+  resolveApproval(id,status,response="") { this.db.prepare("UPDATE approvals SET status=?,response=?,updated_at=? WHERE id=? AND status='PENDING'").run(status,response,now(),id);return this.getApproval(id); }
+
+  createOperationApproval({workspaceId,operation,resourceId=null,payload={}}){const id=randomUUID();this.db.prepare("INSERT INTO operation_approvals (id,workspace_id,operation,resource_id,payload,status,created_at,updated_at) VALUES (?,?,?,?,?,'PENDING',?,?)").run(id,workspaceId,operation,resourceId,JSON.stringify(payload),now(),now());return this.getOperationApproval(id);}
+  getOperationApproval(id){return parseJsonColumns(this.db.prepare("SELECT * FROM operation_approvals WHERE id=?").get(id),["payload"]);}
+  listOperationApprovals(workspaceId){return this.db.prepare("SELECT * FROM operation_approvals WHERE workspace_id=? ORDER BY created_at DESC").all(workspaceId).map((r)=>parseJsonColumns(r,["payload"]));}
+  resolveOperationApproval(id,status,response=""){this.db.prepare("UPDATE operation_approvals SET status=?,response=?,updated_at=? WHERE id=? AND status='PENDING'").run(status,response,now(),id);return this.getOperationApproval(id);}
+  consumeOperationApproval(id,operation,resourceId){if(!id)return false;return this.db.prepare("UPDATE operation_approvals SET consumed_at=?,updated_at=? WHERE id=? AND operation=? AND (resource_id=? OR resource_id IS NULL) AND status='APPROVED' AND consumed_at IS NULL").run(now(),now(),id,operation,resourceId).changes===1;}
+  consumeNextOperationApproval(workspaceId,operation,resourceId){const row=this.db.prepare("SELECT id FROM operation_approvals WHERE workspace_id=? AND operation=? AND (resource_id=? OR resource_id IS NULL) AND status='APPROVED' AND consumed_at IS NULL ORDER BY created_at LIMIT 1").get(workspaceId,operation,resourceId);return row?this.consumeOperationApproval(row.id,operation,resourceId):false;}
 
   // ── Providers ──────────────────────────────────────────────────
   createProvider({ name, baseUrl, apiKey, model, setActive = false }) {
@@ -552,20 +642,20 @@ export class Store {
       .prepare(
         "INSERT INTO providers (id, name, base_url, api_key, model, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
       )
-      .run(id, name, baseUrl, apiKey, model, setActive ? 1 : 0, now());
+      .run(id, name, baseUrl, this.secrets.encode(apiKey), model, setActive ? 1 : 0, now());
     return this.getProvider(id);
   }
 
   getProvider(id) {
-    return this.db.prepare("SELECT * FROM providers WHERE id = ?").get(id);
+    const p=this.db.prepare("SELECT * FROM providers WHERE id = ?").get(id);return p?{...p,api_key:this.secrets.decode(p.api_key)}:p;
   }
 
   getActiveProvider() {
-    return this.db.prepare("SELECT * FROM providers WHERE is_active = 1 LIMIT 1").get();
+    const p=this.db.prepare("SELECT * FROM providers WHERE is_active = 1 LIMIT 1").get();return p?{...p,api_key:this.secrets.decode(p.api_key)}:p;
   }
 
   listProviders() {
-    return this.db.prepare("SELECT * FROM providers ORDER BY created_at ASC").all();
+    return this.db.prepare("SELECT * FROM providers ORDER BY created_at ASC").all().map((p)=>({...p,api_key:this.secrets.decode(p.api_key)}));
   }
 
   updateProvider(id, patch) {
@@ -576,7 +666,7 @@ export class Store {
       .run(
         patch.name ?? row.name,
         patch.baseUrl ?? row.base_url,
-        patch.apiKey ?? row.api_key,
+        this.secrets.encode(patch.apiKey ?? row.api_key),
         patch.model ?? row.model,
         id
       );
@@ -593,14 +683,14 @@ export class Store {
   }
 
   // ── Sessions / Traces ────────────────────────────────────────────
-  createSession({ cardId, boardId, lane, specialistId, specialistName, provider }) {
+  createSession({ cardId, boardId, lane, specialistId, specialistName, provider, agentId = null }) {
     const id = randomUUID();
     this.db
       .prepare(
-        `INSERT INTO sessions (id, card_id, board_id, lane, specialist_id, specialist_name, provider, status, started_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`
+        `INSERT INTO sessions (id, card_id, board_id, lane, specialist_id, specialist_name, provider, status, started_at, agent_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)`
       )
-      .run(id, cardId, boardId, lane, specialistId, specialistName, provider, now());
+      .run(id, cardId, boardId, lane, specialistId, specialistName, provider, now(), agentId);
     return id;
   }
 

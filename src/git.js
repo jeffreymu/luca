@@ -85,7 +85,7 @@ export async function gitPush(repoPath, { message }) {
   const staged = await tryGit(["diff", "--cached", "--quiet"], repoPath);
   if (staged === null) {
     // exit code 1: there are staged changes
-    const msg = (message ?? "").trim() || "chore: update via Luca";
+    const msg = (message ?? "").trim() || "chore: update via LucaPi";
     await runGit(["commit", "-m", msg], repoPath);
     committed = (await runGit(["rev-parse", "--short", "HEAD"], repoPath)).stdout.trim();
   }

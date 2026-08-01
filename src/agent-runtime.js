@@ -28,9 +28,11 @@ async function safeExistingPath(root, relative = ".") {
 
 async function safeWritePath(root, relative) {
   const target = lexicallySafePath(root, relative);
+  if(target===root)throw new Error("File path must not be the worktree root");
   const realRoot = await realpath(root);
   let ancestor = path.dirname(target);
   while (ancestor !== root) {
+    if(!ancestor.startsWith(root+path.sep))throw new Error("Write path parent escapes worktree");
     try { await access(ancestor); break; } catch { ancestor = path.dirname(ancestor); }
   }
   const realAncestor = await realpath(ancestor);
@@ -38,9 +40,9 @@ async function safeWritePath(root, relative) {
   return target;
 }
 
-function exec(command, args, cwd, timeoutMs) {
+function exec(command, args, cwd, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
-    execFile(command, args, { cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile(command, args, { cwd, timeout: timeoutMs, signal, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) reject(new Error(`${command} failed (${err.code ?? 1}): ${String(stderr || err.message).slice(-4000)}`));
       else resolve({ stdout: String(stdout).slice(-20_000), stderr: String(stderr).slice(-20_000), exitCode: 0 });
     });
@@ -66,7 +68,7 @@ export class ToolExecutor {
     };
   }
 
-  async execute(name, args = {}) {
+  async execute(name, args = {}, {signal} = {}) {
     if (name === "read_file") return { content: (await readFile(await safeExistingPath(this.root, args.path), "utf8")).slice(0, 100_000) };
     if (name === "write_file") {
       const target = await safeWritePath(this.root, args.path); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, args.content, "utf8"); return { written: args.path, bytes: Buffer.byteLength(args.content) };
@@ -81,8 +83,8 @@ export class ToolExecutor {
       if (!this.policy.allowedCommands.includes(args.command)) throw new Error(`Command not allowed: ${args.command}`);
       const commandArgs=(args.args ?? []).map(String);
       if(this.policy.allowOutsidePaths!==true && commandArgs.some((arg)=>path.isAbsolute(arg)||arg.includes("../")||arg.includes("=/"))) throw new Error("Command argument may escape worktree");
-      if(this.policy.containerId) return exec("docker",["exec","--workdir","/workspace",this.policy.containerId,args.command,...commandArgs],this.root,this.policy.timeoutMs);
-      return exec(args.command, commandArgs, this.root, this.policy.timeoutMs);
+      if(this.policy.containerId) return exec("docker",["exec","--workdir","/workspace",this.policy.containerId,args.command,...commandArgs],this.root,this.policy.timeoutMs,signal);
+      return exec(args.command, commandArgs, this.root, this.policy.timeoutMs,signal);
     }
     if (name === "git_status") return { status: (await runGit(["status", "--short", "--branch"], this.root)).stdout };
     if (name === "git_diff") return { diff: (await runGit(["diff", "--no-ext-diff"], this.root)).stdout.slice(0,100_000) };
@@ -101,20 +103,24 @@ export class CodingAgentRuntime {
       { role: "user", content: `CARD: ${card.title}\nOBJECTIVE: ${card.objective}\nSTORY: ${JSON.stringify(story)}\nBRIEF: ${JSON.stringify(brief)}` },
     ];
     const toolCalls = [];
-    for (let turn=0; turn<maxTurns; turn++) {
+    const controller=new AbortController();
+    const cancelTimer=setInterval(()=>{if(shouldCancel())controller.abort(new Error("Session cancelled by operator"));},100);cancelTimer.unref?.();
+    try { for (let turn=0; turn<maxTurns; turn++) {
       if (shouldCancel()) throw new Error("Session cancelled by operator");
-      const message = await this.provider.chat({ messages, tools: TOOL_DEFS });
+      const message = await this.provider.chat({ messages, tools: TOOL_DEFS, signal:controller.signal });
       messages.push(message);
       if (!message.tool_calls?.length) return { summary: message.content || "Agent finished", toolCalls, turns: turn+1 };
       for (const call of message.tool_calls) {
         let args={}; try { args=JSON.parse(call.function.arguments||"{}"); } catch {}
         const record={tool:call.function.name,args,ok:false}; onEvent({type:"tool_start",...record});
-        try { record.result=await executor.execute(call.function.name,args); record.ok=true; }
-        catch(err) { record.error=err.message; }
-        toolCalls.push(record); onEvent({type:"tool_end",...record});
+        let cancellationError=null;
+        try { record.result=await executor.execute(call.function.name,args,{signal:controller.signal}); record.ok=true; }
+        catch(err) { record.error=err.message;if(controller.signal.aborted)cancellationError=err; }
+        toolCalls.push(record); onEvent({type:"tool_end",...record});if(cancellationError)throw cancellationError;
         messages.push({role:"tool",tool_call_id:call.id,content:JSON.stringify(record.ok?record.result:{error:record.error})});
       }
     }
     throw new Error(`Coding agent exceeded ${maxTurns} turns`);
+    } finally { clearInterval(cancelTimer); }
   }
 }

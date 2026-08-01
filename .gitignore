@@ -1,6 +1,9 @@
-# Luca runtime data
+# LucaPi runtime data
 luca.db
 luca.db-*
+lucapi.db
+lucapi.db-*
+.lucapi-backups/
 
 # Node
 node_modules/

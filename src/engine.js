@@ -1,8 +1,6 @@
 /**
- * Luca delivery engine — runs lane specialists against cards, enforces
- * entry gates (distrust upstream), records sessions + traces, and moves
- * cards along the board. Mirrors Routa's workflow-orchestrator semantics:
- * each downstream lane is deliberately stricter than the previous one.
+ * LucaPi delivery engine — runs lane specialists against cards, enforces
+ * distrust gates, records sessions and moves cards through the delivery board.
  */
 import { SPECIALISTS, LANES } from "./specialists.js";
 
@@ -24,7 +22,7 @@ export class Engine {
    * Run the specialist of the card's current lane exactly once.
    * Returns { card, sessionId, moved, decision }.
    */
-  async runCard(cardId) {
+  async runCard(cardId, { agent = null } = {}) {
     const card = this.store.getCard(cardId);
     if (!card) throw new Error(`Card not found: ${cardId}`);
     const lane = card.column_id;
@@ -39,7 +37,7 @@ export class Engine {
       return { card, sessionId: null, moved: false, decision: { action: "stay", reason: "No-op: already reported." } };
     }
 
-    const providers = this.getProviders(config?.provider_id ?? null);
+    const providers = this.getProviders(agent?.provider_id ?? config?.provider_id ?? null);
     const providerName = providers.primary.name;
     const sessionId = this.store.createSession({
       cardId: card.id,
@@ -48,6 +46,7 @@ export class Engine {
       specialistId: specialist.id,
       specialistName: specialist.name,
       provider: providerName,
+      agentId: agent?.id ?? null,
     });
     let seq = 0;
     const trace = (kind, message, data) => this.store.trace(sessionId, ++seq, kind, message, data);
@@ -89,6 +88,7 @@ export class Engine {
           provider: providers.primary,
           onEvent: (event) => trace("tool", `${event.tool}: ${event.type}`, event),
           shouldCancel: () => this.store.isSessionCancelRequested(sessionId),
+          agent,
         });
       } catch (err) {
         trace("error", `真实编码执行失败: ${err.message}`);
@@ -100,7 +100,11 @@ export class Engine {
     }
     if (this.realExecution && lane === "review") {
       try { produced = await this.realExecution.executeReview({ card, provider: providers.mode === "llm" ? providers.primary : null }); }
-      catch (err) { trace("error", `独立真实评审失败: ${err.message}`); }
+      catch (err) {
+        trace("error", `独立真实评审失败: ${err.message}`);
+        const hasRealEvidence=[...card.artifacts].reverse().find((artifact)=>artifact.type==="evidence")?.data?.evidence?.real===true;
+        if(hasRealEvidence)produced={artifact:{lane,specialist:specialist.name,type:"feedback",content:`## Independent Review Infrastructure Failure\n\n${err.message}`,data:{realReviewFailure:true}},decision:{action:"move",target:"blocked",verdict:"BLOCKED",reason:"真实评审基础设施失败，禁止降级批准。"}};
+      }
     }
     if (!produced && providers.mode === "llm") {
       try {

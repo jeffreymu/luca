@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Luca — Multi-Agent Delivery Board</title>
+  <title>LucaPi — Autonomous Delivery Platform</title>
   <link rel="stylesheet" href="/styles.css" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>◆</text></svg>" />
 </head>
@@ -11,13 +11,15 @@
   <header id="topbar">
     <div class="brand">
       <span class="logo">◆</span>
-      <span class="name">Luca</span>
+      <span class="name">LucaPi</span>
       <span class="tagline">workspace-first multi-agent delivery</span>
     </div>
     <div class="topbar-controls">
       <select id="workspace-select" title="切换 workspace"></select>
       <button id="new-workspace-btn" class="btn ghost" title="新建 workspace">+ Workspace</button>
       <button id="git-btn" class="btn ghost">⎇ Git</button>
+      <button id="platform-btn" class="btn ghost">◫ Platform</button>
+      <button id="api-token-btn" class="btn ghost" title="远程部署 API Token">🔑</button>
       <button id="providers-btn" class="btn ghost">⚙ Providers</button>
       <button id="run-board-btn" class="btn primary">▶ Run Board Automation</button>
     </div>
@@ -66,7 +68,7 @@
     <div class="modal-box">
       <h2>新建 Workspace</h2>
       <label>名称<input id="ws-name-input" placeholder="例如：支付网关重构" /></label>
-      <label>代码库路径（默认 = Luca 启动目录，可修改）<input id="ws-repo-input" placeholder="/path/to/repo" /></label>
+      <label>代码库路径（默认 = LucaPi 启动目录，可修改）<input id="ws-repo-input" placeholder="/path/to/repo" /></label>
       <div class="modal-actions">
         <button id="ws-modal-cancel" class="btn ghost">取消</button>
         <button id="ws-modal-create" class="btn primary">创建</button>
@@ -129,10 +131,33 @@
         <label>GitHub token<input id="github-token" type="password" placeholder="ghp_...（留空保持不变）" /></label>
         <label>仓库 slug（可选，留空则从 origin 推断）<input id="github-repo" placeholder="owner/repo" /></label>
         <label>API base（可选，企业版）<input id="github-api-base" placeholder="https://api.github.com" /></label>
+        <label>Sandbox 模式<select id="sandbox-mode"><option value="local">Local policy</option><option value="auto">Docker 可用时启用</option><option value="docker">强制 Docker</option></select></label>
+        <label>Sandbox 镜像<input id="sandbox-image" placeholder="node:22-alpine" /></label>
+        <label>Sandbox 网络<select id="sandbox-network"><option value="false">禁用（默认）</option><option value="true">启用（执行时需一次性审批）</option></select></label>
+        <label>需审批操作（逗号分隔）<input id="approval-operations" placeholder="git.push, git.pr, card.deliver, card.delete" /></label>
+        <label>验证命令 JSON<input id="validation-commands" placeholder='[["npm","test"]]' /></label>
       </div>
       <div class="modal-actions">
         <button id="git-close" class="btn ghost">关闭</button>
         <button id="git-save-settings" class="btn primary">保存设置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Platform operations console -->
+  <div id="platform-modal" class="modal hidden">
+    <div class="modal-box platform-console">
+      <div class="drawer-head"><h2>◫ LucaPi Platform Console</h2><button id="platform-close" class="btn ghost">✕</button></div>
+      <div id="platform-tabs" class="platform-tabs"></div>
+      <div class="platform-grid">
+        <section><h3 id="platform-title">资源</h3><div id="platform-list"></div></section>
+        <section>
+          <h3>创建 / 操作</h3>
+          <p id="platform-help" class="muted"></p>
+          <textarea id="platform-json" rows="14" spellcheck="false">{}</textarea>
+          <div class="modal-actions"><button id="platform-refresh" class="btn ghost">刷新</button><button id="platform-submit" class="btn primary">提交</button></div>
+          <h3>结果</h3><pre id="platform-result" class="platform-result"></pre>
+        </section>
       </div>
     </div>
   </div>

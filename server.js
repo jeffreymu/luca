@@ -1,10 +1,12 @@
 /**
- * Luca HTTP server — zero-dependency REST + SSE + static SPA.
+ * LucaPi HTTP server — zero-dependency REST + SSE + static SPA.
  *
  * Exports createServer() for tests; listens only when run directly.
  */
 import http from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDb, Store } from "./src/db.js";
@@ -19,6 +21,7 @@ import {
   providerFromRow,
   maskApiKey,
   testProvider,
+  diagnoseProvider,
   SimulatedProvider,
 } from "./src/providers.js";
 import { LANES, LANE_META, listSpecialists } from "./src/specialists.js";
@@ -35,7 +38,7 @@ const MIME = {
   ".png": "image/png",
 };
 
-export function createApp({ dbPath = "luca.db" } = {}) {
+export function createApp({ dbPath = "lucapi.db", apiToken = process.env.LUCAPI_API_TOKEN, startWorker = true } = {}) {
   const store = new Store(openDb(dbPath));
   const sseClients = new Set();
   const broadcast = (event) => {
@@ -50,7 +53,7 @@ export function createApp({ dbPath = "luca.db" } = {}) {
     return resolveProvider(); // env vars, else simulated
   }, broadcast, new RealExecutionService(store));
   const worker = new DurableWorker({ store, engine, broadcast });
-  worker.start();
+  if(startWorker) worker.start();
 
   const providerInfo = () => {
     const p = engine.getProviders();
@@ -65,6 +68,8 @@ export function createApp({ dbPath = "luca.db" } = {}) {
       name: w.name,
       repoPath: w.repo_path,
       createdAt: w.created_at,
+      validationCommands: (()=>{try{return JSON.parse(w.validation_commands||"null");}catch{return null;}})(),
+      sandboxPolicy: (()=>{try{return JSON.parse(w.sandbox_policy||"{}");}catch{return {};}})(),
       github: {
         hasToken: Boolean(w.github_token),
         tokenMasked: w.github_token ? maskApiKey(w.github_token) : null,
@@ -72,6 +77,9 @@ export function createApp({ dbPath = "luca.db" } = {}) {
         apiBase: w.github_api_base ?? null,
       },
     };
+
+  const approvalRequired=(workspace,operation)=>{try{return JSON.parse(workspace?.sandbox_policy||"{}").requireApprovalFor?.includes(operation);}catch{return false;}};
+  const authorizeOperation=(workspace,operation,resourceId,approvalId)=>!approvalRequired(workspace,operation)||store.consumeOperationApproval(approvalId,operation,resourceId);
 
   const requireWorkspaceRepo = (res, workspaceId) => {
     const w = store.getWorkspace(workspaceId);
@@ -95,7 +103,7 @@ export function createApp({ dbPath = "luca.db" } = {}) {
 
   async function readBody(req) {
     let raw = "";
-    for await (const chunk of req) raw += chunk;
+    for await (const chunk of req) { raw += chunk;if(Buffer.byteLength(raw)>1_048_576)throw new Error("Request body exceeds 1 MiB"); }
     req.rawBody = raw;
     if (!raw) return {};
     try {
@@ -111,6 +119,12 @@ export function createApp({ dbPath = "luca.db" } = {}) {
     const method = req.method;
 
     try {
+      const webhookDelivery=method==="POST"&&/^\/api\/webhooks\/[^/]+$/.test(path)&&path!=="/api/webhooks/configs";
+      if(apiToken&&path.startsWith("/api/")&&path!=="/api/health"&&!webhookDelivery){
+        const supplied=String(req.headers.authorization||"").replace(/^Bearer\s+/i,"")||"",suppliedBytes=Buffer.from(supplied),expectedBytes=Buffer.from(String(apiToken));
+        const valid=suppliedBytes.length===expectedBytes.length&&timingSafeEqual(suppliedBytes,expectedBytes);
+        if(!valid)return json(res,401,{error:"Unauthorized"});
+      }
       // ── SSE ────────────────────────────────────────────────────
       if (path === "/api/events" && method === "GET") {
         res.writeHead(200, {
@@ -126,7 +140,7 @@ export function createApp({ dbPath = "luca.db" } = {}) {
 
       // ── API ────────────────────────────────────────────────────
       if (path === "/api/health" && method === "GET") {
-        return json(res, 200, { ok: true, database: "sqlite", worker: { active: worker.active, maxConcurrency: worker.maxConcurrency }, now: new Date().toISOString() });
+        return json(res, 200, { ok: true, database: "sqlite", worker: worker.metrics(), jobs: { pending: store.listJobs({status:"PENDING"}).length, running: store.listJobs({status:"RUNNING"}).length, failed: store.listJobs({status:"FAILED"}).length }, now: new Date().toISOString() });
       }
       if (path === "/api/state" && method === "GET") {
         const workspaces = store.listWorkspaces();
@@ -173,13 +187,13 @@ export function createApp({ dbPath = "luca.db" } = {}) {
 
       if (path === "/api/providers" && method === "POST") {
         const body = await readBody(req);
-        for (const field of ["name", "baseUrl", "apiKey", "model"]) {
+        for (const field of ["name", "baseUrl", "model"]) {
           if (!body[field]?.trim?.()) return badRequest(res, `${field} is required`);
         }
         const row = store.createProvider({
           name: body.name.trim(),
           baseUrl: body.baseUrl.trim(),
-          apiKey: body.apiKey.trim(),
+          apiKey: body.apiKey?.trim() ?? "",
           model: body.model.trim(),
           setActive: body.setActive === true,
         });
@@ -224,11 +238,12 @@ export function createApp({ dbPath = "luca.db" } = {}) {
         return json(res, 200, { ok: true, current: providerInfo() });
       }
 
-      const providerTestMatch = path.match(/^\/api\/providers\/([^/]+)\/test$/);
+      const providerTestMatch = path.match(/^\/api\/providers\/([^/]+)\/(test|diagnose)$/);
       if (providerTestMatch && method === "POST") {
         const row = store.getProvider(providerTestMatch[1]);
         if (!row) return notFound(res);
-        const result = await testProvider(providerFromRow(row));
+        const provider=providerFromRow(row);
+        const result = providerTestMatch[2] === "diagnose" ? await diagnoseProvider(provider) : await testProvider(provider);
         return json(res, 200, result);
       }
 
@@ -237,7 +252,7 @@ export function createApp({ dbPath = "luca.db" } = {}) {
         if (!body.name?.trim()) return badRequest(res, "name is required");
         const result = store.createWorkspace({
           name: body.name.trim(),
-          // default: the directory Luca was started from; editable later via PATCH / Git panel
+          // default: the directory LucaPi was started from; editable later via PATCH / Git panel
           repoPath: body.repoPath?.trim() || process.cwd(),
         });
         broadcast({ type: "workspace" });
@@ -246,6 +261,8 @@ export function createApp({ dbPath = "luca.db" } = {}) {
 
       const wsMatch = path.match(/^\/api\/workspaces\/([^/]+)$/);
       if (wsMatch && method === "DELETE") {
+        const workspace=store.getWorkspace(wsMatch[1]),board=store.getBoardByWorkspace(wsMatch[1]);
+        if(workspace&&board)for(const card of store.listCards(board.id).filter((c)=>c.worktree_path))await new RealExecutionService(store).worktrees.remove(workspace.repo_path,card.worktree_path,{force:true}).catch(()=>{});
         store.deleteWorkspace(wsMatch[1]);
         broadcast({ type: "workspace" });
         return json(res, 200, { ok: true });
@@ -290,6 +307,7 @@ export function createApp({ dbPath = "luca.db" } = {}) {
 
           if (op === "push" && method === "POST") {
             const body = await readBody(req);
+            if(!authorizeOperation(w,"git.push",workspaceId,body.approvalId))return json(res,403,{error:"approved operation approval required"});
             const result = await gitPush(w.repo_path, { message: body.message });
             broadcast({ type: "git", workspaceId });
             return json(res, 200, result);
@@ -297,6 +315,7 @@ export function createApp({ dbPath = "luca.db" } = {}) {
 
           if (op === "pr" && method === "POST") {
             const body = await readBody(req);
+            if(!authorizeOperation(w,"git.pr",workspaceId,body.approvalId))return json(res,403,{error:"approved operation approval required"});
             const token = w.github_token ?? process.env.GITHUB_TOKEN;
             if (!token) return badRequest(res, "未配置 GitHub token：请在 Git 面板中保存 token，或设置 GITHUB_TOKEN 环境变量。");
             const status = await gitStatus(w.repo_path);
@@ -306,7 +325,7 @@ export function createApp({ dbPath = "luca.db" } = {}) {
             const base = body.base?.trim() || "main";
             if (!body.title?.trim()) return badRequest(res, "title is required");
             const pr = await createPullRequest({
-              apiBase: w.github_api_base ?? process.env.LUCA_GITHUB_API ?? "https://api.github.com",
+              apiBase: w.github_api_base ?? process.env.LUCAPI_GITHUB_API ?? process.env.LUCA_GITHUB_API ?? "https://api.github.com",
               token,
               slug,
               title: body.title.trim(),
@@ -373,6 +392,9 @@ export function createApp({ dbPath = "luca.db" } = {}) {
           return json(res, 200, updated);
         }
         if (method === "DELETE") {
+          const workspace=store.getWorkspaceByBoard(card.board_id);const body=await readBody(req);
+          if(!authorizeOperation(workspace,"card.delete",card.id,body.approvalId))return json(res,403,{error:"approved operation approval required"});
+          if(card.worktree_path){await new RealExecutionService(store).worktrees.remove(workspace.repo_path,card.worktree_path,{force:true}).catch(()=>{});}
           store.deleteCard(card.id);
           broadcast({ type: "card", cardId: card.id, boardId: card.board_id });
           return json(res, 200, { ok: true });
@@ -428,23 +450,26 @@ export function createApp({ dbPath = "luca.db" } = {}) {
 
       notFound(res);
     } catch (err) {
-      json(res, 500, { error: err.message });
+      const status=err.message==="Invalid JSON body"?400:err.message.includes("exceeds 1 MiB")?413:500;
+      json(res, status, { error: err.message });
     }
   });
 
-  server.on("close", () => worker.stop());
+  server.on("close", () => { void worker.stop(); });
   return { server, store, engine, worker };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const port = Number(process.env.PORT ?? 3210);
   const host = process.env.HOST ?? "127.0.0.1"; // tool/file APIs are local-only by default
-  const dbPath = process.env.LUCA_DB ?? "luca.db";
-  const { server, engine } = createApp({ dbPath });
+  const dbPath = process.env.LUCAPI_DB ?? process.env.LUCA_DB ?? (existsSync("luca.db") ? "luca.db" : "lucapi.db");
+  const { server, engine, worker } = createApp({ dbPath, startWorker:process.env.LUCAPI_EMBEDDED_WORKER!=="false" });
   server.listen(port, host, () => {
     console.log(`\n  ◆ LucaPi — workspace-first multi-agent delivery board`);
     console.log(`  ◆ http://${host}:${port}`);
-    console.log(`  ◆ provider: ${engine.getProviders().mode === "llm" ? engine.getProviders().primary.name : "simulated (configure one in ⚙ Providers, or set LUCA_LLM_BASE_URL/API_KEY/MODEL)"}`);
+    console.log(`  ◆ provider: ${engine.getProviders().mode === "llm" ? engine.getProviders().primary.name : "simulated (configure one in ⚙ Providers, or set LUCAPI_LLM_BASE_URL/API_KEY/MODEL)"}`);
     console.log(`  ◆ db: ${dbPath}\n`);
   });
+  const shutdown=async()=>{console.log("\n  ◆ draining worker…");await worker.stop();server.close();};
+  process.once("SIGTERM",shutdown);process.once("SIGINT",shutdown);
 }

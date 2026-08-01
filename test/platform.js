@@ -17,8 +17,8 @@ const external=http.createServer(async(req,res)=>{
   let raw="";for await(const c of req)raw+=c;
   if(req.url==="/v1/models"){res.writeHead(200,{"content-type":"application/json"});res.end(JSON.stringify({data:[{id:"fake-code"}]}));return;}
   if(req.url==="/v1/chat/completions"){
-    const body=JSON.parse(raw),used=body.messages.some((m)=>m.role==="tool");
-    const message=body.response_format?{role:"assistant",content:JSON.stringify({verdict:"APPROVED",findings:[]})}:used?{role:"assistant",content:"Implemented agent-output.txt with a real file tool."}:{role:"assistant",content:null,tool_calls:[{id:"call-1",type:"function",function:{name:"write_file",arguments:JSON.stringify({path:"agent-output.txt",content:"implemented by LucaPi coding agent\n"})}}]};
+    const body=JSON.parse(raw),used=body.messages.some((m)=>m.role==="tool"),probe=body.tools?.some((t)=>t.function?.name==="capability_probe");
+    const message=body.response_format?{role:"assistant",content:JSON.stringify({verdict:"APPROVED",findings:[]})}:probe?{role:"assistant",content:null,tool_calls:[{id:"probe-1",type:"function",function:{name:"capability_probe",arguments:'{"ok":true}'}}]}:used?{role:"assistant",content:"Implemented agent-output.txt with a real file tool."}:{role:"assistant",content:null,tool_calls:[{id:"call-1",type:"function",function:{name:"write_file",arguments:JSON.stringify({path:"agent-output.txt",content:"implemented by LucaPi coding agent\n"})}}]};
     res.writeHead(200,{"content-type":"application/json"});res.end(JSON.stringify({choices:[{message}]}));return;
   }
   if(req.url==="/repos/octo/platform/pulls"&&req.method==="POST"){const b=JSON.parse(raw);res.writeHead(201,{"content-type":"application/json"});res.end(JSON.stringify({number:11,html_url:"http://mock/pr/11",title:b.title,state:"open"}));return;}
@@ -38,6 +38,7 @@ try {
   const card=(await api(`/api/boards/${boardId}/cards`,{method:"POST",body:{title:"Create agent output",objective:"Create agent-output.txt with the requested content."}})).body;
   await api(`/api/cards/${card.id}/run`,{method:"POST"});await api(`/api/cards/${card.id}/run`,{method:"POST"});
   const provider=await api("/api/providers",{method:"POST",body:{name:"Fake Coding LLM",baseUrl:`${externalBase}/v1`,apiKey:"test",model:"fake-code",setActive:true}});check("coding provider configured",provider.status===201);
+  const diagnosis=await api(`/api/providers/${provider.body.id}/diagnose`,{method:"POST"});check("provider capability diagnosis covers tools and structured JSON",diagnosis.body.ok&&diagnosis.body.checks.toolCalling.ok&&diagnosis.body.checks.structuredJson.ok);
   const dev=await api(`/api/cards/${card.id}/run`,{method:"POST"});
   check("real Coding Agent advances Dev to Review",dev.status===200&&dev.body.card.column_id==="review");
   const evidence=dev.body.card.artifacts.findLast((a)=>a.type==="evidence");
@@ -61,6 +62,7 @@ try {
   const rpc=await api("/api/mcp",{method:"POST",body:{jsonrpc:"2.0",id:1,method:"tools/list",params:{}}});check("MCP JSON-RPC tools/list is supported",rpc.body.result.tools.some((t)=>t.name==="read_file"));
   const sandbox=await api("/api/sandboxes/explain",{method:"POST",body:{workspaceId}});check("sandbox policy is explainable",sandbox.body.enforcement.includes("command/argument allowlist"));
   const dockerStatus=await api("/api/sandboxes");check("Docker sandbox availability is reported safely",typeof dockerStatus.body.available==="boolean");
+  if(dockerStatus.body.available){const box=await api("/api/sandboxes",{method:"POST",body:{workspaceId,image:"node:22-alpine"}}),inside=await api(`/api/sandboxes/${box.body.id}/execute`,{method:"POST",body:{command:"node",args:["-e","console.log('sandbox-ok')"]}});check("Docker sandbox lifecycle is verified",inside.body.stdout.includes("sandbox-ok")&&(await api(`/api/sandboxes/${box.body.id}`,{method:"DELETE"})).body.ok);}else check("Docker sandbox lifecycle degrades safely without daemon",dockerStatus.body.containers.length===0);
 
   await api("/api/providers/deactivate",{method:"POST"});
   const ws2=await api("/api/workspaces",{method:"POST",body:{name:"DAG",repoPath:work}}),w2=ws2.body.workspace.id,b2=ws2.body.board.id;
@@ -72,17 +74,28 @@ try {
   const trigger=await api(`/api/workflows/${workflow.body.id}/trigger`,{method:"POST"});check("workflow trigger creates durable job",trigger.status===202&&trigger.body.status==="PENDING");
   await api("/api/jobs/process",{method:"POST"});const jobs=await api(`/api/jobs?workspaceId=${w2}`);check("durable worker completes or leases workflow job",jobs.body.some((j)=>j.id===trigger.body.id&&["COMPLETED","RUNNING"].includes(j.status)));
   const schedule=await api("/api/schedules",{method:"POST",body:{workspaceId:w2,workflowId:workflow.body.id,name:"Hourly",intervalMinutes:60}});check("schedule is persisted",schedule.status===201);
+  const cron=await api("/api/schedules",{method:"POST",body:{workspaceId:w2,workflowId:workflow.body.id,name:"Weekdays",cronExpression:"0 9 * * 1-5",timezone:"Asia/Shanghai",concurrencyPolicy:"FORBID"}}),paused=await api(`/api/schedules/${cron.body.id}`,{method:"PATCH",body:{enabled:false}});check("cron schedule supports timezone and pause",cron.status===201&&cron.body.timezone==="Asia/Shanghai"&&paused.body.enabled===0);
   const hook=await api("/api/webhooks/configs",{method:"POST",body:{workspaceId:w2,workflowId:workflow.body.id,event:"issues"}});check("webhook config is persisted",hook.status===201);
   const webhook=await api(`/api/webhooks/${w2}`,{method:"POST",headers:{"x-github-event":"issues"},body:{action:"opened"}});check("webhook event enqueues workflow",webhook.status===202&&webhook.body.jobs.length===1);
   await api("/api/webhooks/configs",{method:"POST",body:{workspaceId:w2,workflowId:workflow.body.id,event:"push",secret:"hook-secret"}});
   const rejectedHook=await api(`/api/webhooks/${w2}`,{method:"POST",headers:{"x-github-event":"push"},body:{ref:"main"}});check("signed webhook rejects missing signature",rejectedHook.status===401);
   const hookPayload={ref:"main"},signature=`sha256=${createHmac("sha256","hook-secret").update(JSON.stringify(hookPayload)).digest("hex")}`;
-  const acceptedHook=await api(`/api/webhooks/${w2}`,{method:"POST",headers:{"x-github-event":"push","x-hub-signature-256":signature},body:hookPayload});check("signed webhook accepts valid HMAC",acceptedHook.status===202&&acceptedHook.body.jobs.length===1);
-  const agent=await api("/api/agents",{method:"POST",body:{workspaceId:w2,name:"Crafter A",role:"CRAFTER"}});check("agent registry persists agent",agent.status===201);
+  const acceptedHook=await api(`/api/webhooks/${w2}`,{method:"POST",headers:{"x-github-event":"push","x-hub-signature-256":signature,"x-github-delivery":"delivery-1"},body:hookPayload});check("signed webhook accepts valid HMAC",acceptedHook.status===202&&acceptedHook.body.jobs.length===1);
+  const duplicateHook=await api(`/api/webhooks/${w2}`,{method:"POST",headers:{"x-github-event":"push","x-hub-signature-256":signature,"x-github-delivery":"delivery-1"},body:hookPayload}),hookLogs=await api(`/api/webhooks/logs?workspaceId=${w2}`);check("webhook delivery is idempotent and auditable",duplicateHook.body.jobs.length===0&&duplicateHook.body.duplicates.length===1&&hookLogs.body.some((l)=>l.delivery_id==="delivery-1"));
+  const agent=await api("/api/agents",{method:"POST",body:{workspaceId:w2,name:"Crafter A",role:"CRAFTER",providerId:provider.body.id}});check("agent registry persists agent",agent.status===201);
   const team=await api("/api/team-runs",{method:"POST",body:{workspaceId:w2,boardId:b2,goal:"Ship release",maxConcurrency:2}});check("team run creates coordinator message and durable job",team.status===202&&team.body.run.messages.length===1&&team.body.job.type==="team.run");
   let teamJob=team.body.job;
   for(let i=0;i<80&&["PENDING","RUNNING"].includes(teamJob.status);i++){await new Promise((r)=>setTimeout(r,100));teamJob=(await api(`/api/jobs/${teamJob.id}`)).body;}
   const teamResult=await api(`/api/team-runs/${team.body.run.id}`);check("team worker executes ready cards with bounded concurrency",["COMPLETED","BLOCKED"].includes(teamResult.body.status)&&teamResult.body.messages.length>=2);
+  const assignedSessions=await api(`/api/cards/${dec.body.cards[0].id}/sessions`);check("team assigns cards to agents and honors agent provider",assignedSessions.body.some((s)=>s.agent_id===agent.body.id&&s.provider.includes("Fake Coding LLM")));
+  const approvalTeam=await api("/api/team-runs",{method:"POST",body:{workspaceId:w2,boardId:b2,goal:"Approved maintenance",maxConcurrency:1,approvalRequired:true}});check("approval gate prevents team job enqueue",approvalTeam.body.run.status==="WAITING_APPROVAL"&&!approvalTeam.body.job&&approvalTeam.body.approval.status==="PENDING");
+  const approval=await api(`/api/approvals/${approvalTeam.body.approval.id}`,{method:"POST",body:{status:"APPROVED",response:"integration test"}});check("approval resumes team through durable queue",approval.body.job?.type==="team.run"&&approval.body.run.status!=="WAITING_APPROVAL");
+  const health=await api("/api/health");check("health exposes worker identity and queue metrics",health.body.worker.workerId&&Number.isInteger(health.body.jobs.pending));
+  const schema=await api("/api/admin/schema");check("database exposes ordered migration version",schema.body.userVersion>=2&&schema.body.migrations.length>=2);
+  await api(`/api/workspaces/${w2}`,{method:"PATCH",body:{sandboxPolicy:{requireApprovalFor:["card.delete"]}}});const guarded=(await api(`/api/boards/${b2}/cards`,{method:"POST",body:{title:"Guarded delete"}})).body,deniedDelete=await api(`/api/cards/${guarded.id}`,{method:"DELETE",body:{}}),operationRequest=await api("/api/operation-approvals",{method:"POST",body:{workspaceId:w2,operation:"card.delete",resourceId:guarded.id,payload:{reason:"test"}}});await api(`/api/operation-approvals/${operationRequest.body.id}`,{method:"POST",body:{status:"APPROVED",response:"test"}});const allowedDelete=await api(`/api/cards/${guarded.id}`,{method:"DELETE",body:{approvalId:operationRequest.body.id}});check("operation approval gates and resumes destructive action",deniedDelete.status===403&&allowedDelete.status===200);
+
+  const secured=createApp({dbPath:":memory:",apiToken:"secret-token"}),securedServer=secured.server;await new Promise((r)=>securedServer.listen(0,r));const securedBase=`http://127.0.0.1:${securedServer.address().port}`;
+  const publicHealth=await fetch(`${securedBase}/api/health`),denied=await fetch(`${securedBase}/api/state`),authorized=await fetch(`${securedBase}/api/state`,{headers:{authorization:"Bearer secret-token"}});check("optional API token protects platform APIs",publicHealth.status===200&&denied.status===401&&authorized.status===200);securedServer.close();
 
   console.log("\nPlatform checks passed ✅\n");
 } finally { server.close(); external.close(); }
