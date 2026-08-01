@@ -1,4 +1,4 @@
-# ◆ Luca
+# ◆ LucaPi
 
 **Workspace-first multi-agent kanban delivery board** — LucaPi，轻量级 Web 应用，完成任务价值的端到端交付。
 
