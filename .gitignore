@@ -1,0 +1,13 @@
+# Luca runtime data
+luca.db
+luca.db-*
+
+# Node
+node_modules/
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

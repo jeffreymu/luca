@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Luca — Multi-Agent Delivery Board</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>◆</text></svg>" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">
+      <span class="logo">◆</span>
+      <span class="name">Luca</span>
+      <span class="tagline">workspace-first multi-agent delivery</span>
+    </div>
+    <div class="topbar-controls">
+      <select id="workspace-select" title="切换 workspace"></select>
+      <button id="new-workspace-btn" class="btn ghost" title="新建 workspace">+ Workspace</button>
+      <button id="git-btn" class="btn ghost">⎇ Git</button>
+      <button id="providers-btn" class="btn ghost">⚙ Providers</button>
+      <button id="run-board-btn" class="btn primary">▶ Run Board Automation</button>
+    </div>
+  </header>
+
+  <main id="board" aria-live="polite"></main>
+
+  <!-- Card detail drawer -->
+  <div id="drawer-overlay" class="hidden"></div>
+  <aside id="drawer" class="hidden">
+    <div class="drawer-head">
+      <div>
+        <h2 id="drawer-title"></h2>
+        <div id="drawer-meta" class="muted"></div>
+      </div>
+      <button id="drawer-close" class="btn ghost">✕</button>
+    </div>
+    <p id="drawer-objective"></p>
+    <div class="drawer-actions">
+      <button id="run-card-btn" class="btn primary">▶ 运行当前泳道 Specialist</button>
+      <select id="move-select" title="手动移动卡片"></select>
+      <button id="delete-card-btn" class="btn danger">删除</button>
+    </div>
+    <h3>工件时间线 <span class="muted">（随流程增长）</span></h3>
+    <div id="artifact-timeline"></div>
+    <h3>Sessions &amp; Traces</h3>
+    <div id="session-list"></div>
+  </aside>
+
+  <!-- New card modal -->
+  <div id="card-modal" class="modal hidden">
+    <div class="modal-box">
+      <h2>新建卡片</h2>
+      <label>标题<input id="card-title-input" placeholder="例如：实现用户登录与密码重置" /></label>
+      <label>目标描述（越具体，验收标准越清晰）<textarea id="card-objective-input" rows="5" placeholder="描述要交付的价值、边界与约束…"></textarea></label>
+      <div class="modal-actions">
+        <button id="card-modal-cancel" class="btn ghost">取消</button>
+        <button id="card-modal-create" class="btn primary">创建到 Backlog</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- New workspace modal -->
+  <div id="ws-modal" class="modal hidden">
+    <div class="modal-box">
+      <h2>新建 Workspace</h2>
+      <label>名称<input id="ws-name-input" placeholder="例如：支付网关重构" /></label>
+      <label>代码库路径（默认 = Luca 启动目录，可修改）<input id="ws-repo-input" placeholder="/path/to/repo" /></label>
+      <div class="modal-actions">
+        <button id="ws-modal-cancel" class="btn ghost">取消</button>
+        <button id="ws-modal-create" class="btn primary">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Providers modal -->
+  <div id="providers-modal" class="modal hidden">
+    <div class="modal-box wide">
+      <h2>LLM Providers</h2>
+      <div id="provider-current" class="muted"></div>
+      <div id="provider-list"></div>
+      <h3 class="modal-sub">添加 Provider（任何 OpenAI 兼容端点）</h3>
+      <div class="provider-form">
+        <label>名称<input id="prov-name" placeholder="例如：DeepSeek / OpenAI / 本地 Ollama" /></label>
+        <label>Base URL<input id="prov-base" placeholder="https://api.openai.com/v1" /></label>
+        <label>API Key<input id="prov-key" type="password" placeholder="sk-..." /></label>
+        <label>模型<input id="prov-model" placeholder="gpt-4o-mini / deepseek-chat / qwen3..." /></label>
+      </div>
+      <div class="modal-actions">
+        <button id="providers-close" class="btn ghost">关闭</button>
+        <button id="prov-add" class="btn primary">添加并启用</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Git modal -->
+  <div id="git-modal" class="modal hidden">
+    <div class="modal-box wide">
+      <h2>⎇ Git / GitHub</h2>
+      <div id="git-status-box"></div>
+
+      <h3 class="modal-sub">拉取</h3>
+      <div class="git-actions">
+        <button id="git-pull-btn" class="btn">↓ Pull (--ff-only)</button>
+        <button id="git-pull-rebase-btn" class="btn ghost">↓ Pull --rebase</button>
+      </div>
+
+      <h3 class="modal-sub">提交并推送当前 worktree 变更</h3>
+      <label>提交信息<input id="git-commit-msg" placeholder="feat: 描述本次变更（留空则使用默认信息）" /></label>
+      <div class="git-actions">
+        <button id="git-push-btn" class="btn primary">↑ Commit & Push</button>
+      </div>
+
+      <h3 class="modal-sub">创建 Pull Request</h3>
+      <label>PR 标题<input id="git-pr-title" placeholder="例如：feat: 实现用户登录" /></label>
+      <div class="provider-form">
+        <label>Base 分支<input id="git-pr-base" placeholder="main" /></label>
+        <label>PR 描述（可选）<input id="git-pr-body" placeholder="变更说明…" /></label>
+      </div>
+      <div class="git-actions">
+        <button id="git-pr-btn" class="btn">⚡ Create PR</button>
+        <span id="git-pr-result"></span>
+      </div>
+
+      <h3 class="modal-sub">GitHub 设置</h3>
+      <div class="provider-form">
+        <label>仓库路径 repo_path<input id="git-repo-path" placeholder="/path/to/local/repo" /></label>
+        <label>GitHub token<input id="github-token" type="password" placeholder="ghp_...（留空保持不变）" /></label>
+        <label>仓库 slug（可选，留空则从 origin 推断）<input id="github-repo" placeholder="owner/repo" /></label>
+        <label>API base（可选，企业版）<input id="github-api-base" placeholder="https://api.github.com" /></label>
+      </div>
+      <div class="modal-actions">
+        <button id="git-close" class="btn ghost">关闭</button>
+        <button id="git-save-settings" class="btn primary">保存设置</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
