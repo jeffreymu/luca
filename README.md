@@ -1,6 +1,6 @@
 # ◆ Luca
 
-**Workspace-first multi-agent kanban delivery board** — LucaPi 旗下的轻量级 Web 应用，完成任务价值的端到端交付。
+**Workspace-first multi-agent kanban delivery board** — LucaPi，轻量级 Web 应用，完成任务价值的端到端交付。
 
 Luca 把「目标、任务、会话、证据、评审」放在看板上而非埋在单个聊天线程里，并做到 **零 npm 依赖、单命令启动、离线可跑**。
 
