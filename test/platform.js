@@ -13,11 +13,13 @@ const git=(args,cwd)=>execFileSync("git",args,{cwd,stdio:"pipe"}).toString().tri
 git(["init","--bare","-b","main","remote.git"],tmp);git(["clone","remote.git","work"],tmp);
 const work=path.join(tmp,"work");git(["config","user.email","agent@test.local"],work);git(["config","user.name","LucaPi Agent"],work);writeFileSync(path.join(work,"README.md"),"# Fixture\n");git(["add","-A"],work);git(["commit","-m","init"],work);git(["push","-u","origin","main"],work);
 
+let codingPromptSawSkillPackage=false;
 const external=http.createServer(async(req,res)=>{
   let raw="";for await(const c of req)raw+=c;
   if(req.url==="/v1/models"){res.writeHead(200,{"content-type":"application/json"});res.end(JSON.stringify({data:[{id:"fake-code"}]}));return;}
   if(req.url==="/v1/chat/completions"){
     const body=JSON.parse(raw),used=body.messages.some((m)=>m.role==="tool"),probe=body.tools?.some((t)=>t.function?.name==="capability_probe");
+    if(body.messages?.some((m)=>String(m.content??"").includes(".lucapi-skills")))codingPromptSawSkillPackage=true;
     const message=body.response_format?{role:"assistant",content:JSON.stringify({verdict:"APPROVED",findings:[]})}:probe?{role:"assistant",content:null,tool_calls:[{id:"probe-1",type:"function",function:{name:"capability_probe",arguments:'{"ok":true}'}}]}:used?{role:"assistant",content:"Implemented agent-output.txt with a real file tool."}:{role:"assistant",content:null,tool_calls:[{id:"call-1",type:"function",function:{name:"write_file",arguments:JSON.stringify({path:"agent-output.txt",content:"implemented by LucaPi coding agent\n"})}}]};
     res.writeHead(200,{"content-type":"application/json"});res.end(JSON.stringify({choices:[{message}]}));return;
   }
@@ -25,6 +27,8 @@ const external=http.createServer(async(req,res)=>{
   if(req.url.startsWith("/repos/octo/platform/issues?")&&req.method==="GET"){res.writeHead(200,{"content-type":"application/json"});res.end(JSON.stringify([{number:2,title:"Bug"},{number:11,title:"PR",pull_request:{}}]));return;}
   if(req.url.startsWith("/repos/octo/platform/pulls?")&&req.method==="GET"){res.writeHead(200,{"content-type":"application/json"});res.end(JSON.stringify([{number:11,title:"Agent delivery",html_url:"http://mock/pr/11"}]));return;}
   if(req.url==="/repos/octo/platform/issues/11/comments"&&req.method==="POST"){res.writeHead(201,{"content-type":"application/json"});res.end(JSON.stringify({id:99,body:JSON.parse(raw).body,html_url:"http://mock/comment/99"}));return;}
+  if(req.url==="/repos/octo/platform/pulls/11/reviews"&&req.method==="POST"){const b=JSON.parse(raw);res.writeHead(200,{"content-type":"application/json"});res.end(JSON.stringify({id:88,state:b.event,html_url:"http://mock/review/88"}));return;}
+  if(req.url==="/repos/octo/platform/check-runs"&&req.method==="POST"){ const b=JSON.parse(raw);res.writeHead(201,{"content-type":"application/json"});res.end(JSON.stringify({id:77,name:b.name,conclusion:b.conclusion,html_url:"http://mock/check/77"}));return;}
   res.writeHead(404);res.end("{}");
 });
 await new Promise((r)=>external.listen(0,r));const externalBase=`http://127.0.0.1:${external.address().port}`;
@@ -39,18 +43,23 @@ try {
   await api(`/api/cards/${card.id}/run`,{method:"POST"});await api(`/api/cards/${card.id}/run`,{method:"POST"});
   const provider=await api("/api/providers",{method:"POST",body:{name:"Fake Coding LLM",baseUrl:`${externalBase}/v1`,apiKey:"test",model:"fake-code",setActive:true}});check("coding provider configured",provider.status===201);
   const diagnosis=await api(`/api/providers/${provider.body.id}/diagnose`,{method:"POST"});check("provider capability diagnosis covers tools and structured JSON",diagnosis.body.ok&&diagnosis.body.checks.toolCalling.ok&&diagnosis.body.checks.structuredJson.ok);
+  await api("/api/scan-profiles",{method:"POST",body:{workspaceId,name:"Post Dev Scan",hook:"post-dev",scanners:["lucapi-secret"],policy:{blockOn:["critical","high"],failOnScannerError:true}}});
+  const packageSkill=await api("/api/skills/import",{method:"POST",body:{workspaceId,source:{type:"content",skillMarkdown:"---\nname: fixture-helper\nversion: 1.0.0\ndescription: Fixture helper\n---\n\nUse the packaged reference when implementing.",manifest:{hooks:["manual"],tools:["read_file"]}}}}),packagePublishRequest=await api(`/api/skills/${packageSkill.body.skill.id}/request-publish`,{method:"POST",body:{workspaceId}});await api(`/api/operation-approvals/${packagePublishRequest.body.id}`,{method:"POST",body:{status:"APPROVED"}});await api(`/api/skills/${packageSkill.body.skill.id}/publish`,{method:"POST",body:{workspaceId}});
   const dev=await api(`/api/cards/${card.id}/run`,{method:"POST"});
   check("real Coding Agent advances Dev to Review",dev.status===200&&dev.body.card.column_id==="review");
   const evidence=dev.body.card.artifacts.findLast((a)=>a.type==="evidence");
-  check("evidence is sourced from real execution",evidence.data.evidence.real===true&&evidence.data.evidence.toolCalls.some((t)=>t.tool==="write_file"&&t.ok));
+  check("evidence is sourced from real execution",evidence.data.evidence.real===true&&codingPromptSawSkillPackage&&!evidence.data.evidence.changed_files.some((f)=>f.startsWith(".lucapi-skills"))&&evidence.data.evidence.scanRunIds.length===1&&evidence.data.evidence.toolCalls.some((t)=>t.tool==="write_file"&&t.ok));
   check("task owns an isolated worktree and branch",Boolean(dev.body.card.worktree_path&&dev.body.card.branch_name&&dev.body.card.base_commit&&dev.body.card.head_commit));
+  const reviewProfile=await api("/api/scan-profiles",{method:"POST",body:{workspaceId,name:"Review Scan",hook:"review",scanners:["code-review","lucapi-secret"],policy:{blockOn:["critical","high"],failOnScannerError:true,newFindingsOnly:true}}});check("review scan profile is configurable",reviewProfile.status===201);
   const review=await api(`/api/cards/${card.id}/run`,{method:"POST"});check("independent real review approves diff",review.body.card.column_id==="done"&&review.body.decision.verdict==="APPROVED");
+  const reviewArtifact=review.body.card.artifacts.findLast((a)=>a.type==="review"),reviewScan=await api(`/api/scans/${reviewArtifact.data.scanRunIds[0]}`);check("review gate persists normalized scanner findings",reviewArtifact.data.scanRunIds.length===1&&reviewScan.body.status==="PASSED");
   const wt=await api(`/api/cards/${card.id}/worktree/validate`,{method:"POST"});check("worktree validation passes",wt.body.healthy===true);
   const delivered=await api(`/api/cards/${card.id}/deliver`,{method:"POST",body:{title:"Agent delivery"}});check("task branch pushed and PR created",delivered.status===201&&delivered.body.pr.number===11);
   const delivery=await api(`/api/cards/${card.id}/delivery`);check("delivery snapshot exposes commit and PR",delivery.body.headCommit&&delivery.body.prUrl==="http://mock/pr/11");
   const issues=await api(`/api/github/issues?workspaceId=${workspaceId}`);check("GitHub issues can be listed",issues.body.length===1&&issues.body[0].number===2);
   const pulls=await api(`/api/github/pulls?workspaceId=${workspaceId}`);check("GitHub pull requests can be listed",pulls.body[0].number===11);
   const comment=await api("/api/github/pr-comment",{method:"POST",body:{workspaceId,number:11,body:"Reviewed by LucaPi"}});check("GitHub PR comment can be posted",comment.status===201&&comment.body.id===99);
+  const publishedScan=await api(`/api/scans/${reviewScan.body.id}/publish-github`,{method:"POST",body:{headSha:review.body.card.head_commit,name:"LucaPi Review",pullRequestNumber:11,createReview:true}});check("scan result publishes a GitHub Check Run",publishedScan.status===201&&publishedScan.body.check.id===77&&publishedScan.body.review.id===88);
 
   const repo=await api(`/api/workspaces/${workspaceId}/repository/analyze`);check("repository intelligence returns files and commits",repo.body.fileCount>0&&repo.body.recentCommits.length>0);
   const fitness=await api("/api/fitness/analyze",{method:"POST",body:{workspaceId}});check("fitness analysis returns governance score",Number.isInteger(fitness.body.score)&&fitness.body.checks);

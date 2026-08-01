@@ -48,6 +48,17 @@ export async function listPullRequests({apiBase,token,slug,state="open"}) {
   return r.json;
 }
 
+export async function createCheckRun({apiBase,token,slug,name,headSha,status="completed",conclusion="neutral",summary,annotations=[]}) {
+  const output={title:name,summary,annotations:annotations.slice(0,50).map((a)=>({path:a.path,start_line:a.startLine??1,end_line:a.endLine??a.startLine??1,annotation_level:a.level??"warning",message:a.message,title:a.title}))};
+  const r=await ghFetch(apiBase,`/repos/${slug}/check-runs`,{token,method:"POST",body:{name,head_sha:headSha,status,conclusion,output}});
+  if(r.status!==201)throw new Error(`GitHub check run HTTP ${r.status}: ${r.json?.message??r.text}`);return r.json;
+}
+
+export async function createPullRequestReview({apiBase,token,slug,number,body,event="COMMENT",comments=[]}) {
+  const r=await ghFetch(apiBase,`/repos/${slug}/pulls/${number}/reviews`,{token,method:"POST",body:{body,event,comments:comments.slice(0,100)}});
+  if(r.status!==200)throw new Error(`GitHub pull request review HTTP ${r.status}: ${r.json?.message??r.text}`);return r.json;
+}
+
 export async function postPullRequestComment({apiBase,token,slug,number,body}) {
   const r=await ghFetch(apiBase,`/repos/${slug}/issues/${number}/comments`,{token,method:"POST",body:{body}});
   if(r.status!==201) throw new Error(`GitHub comment HTTP ${r.status}: ${r.json?.message??r.text}`);

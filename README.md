@@ -7,7 +7,7 @@ LucaPi 把「目标、任务、会话、证据、评审」放在看板上而非�
 ```bash
 npm start          # http://localhost:3210
 npm run worker     # 可选：启动独立持久化 Worker
-npm test           # 109 项基础、平台与可靠性检查
+npm test           # 134 项基础、平台、可靠性、Skills 与扫描检查
 ```
 
 要求 Node.js ≥ 22.5（使用内置 `node:http` 与 `node:sqlite`）。涉及文件和命令工具的服务默认仅监听 `127.0.0.1`；如需远程部署，应在反向代理层配置身份认证与 TLS，再显式设置 `HOST`。
@@ -27,7 +27,7 @@ Backlog ──▶ Todo ──▶ Dev ──▶ Review ──▶ Done
 
 每条泳道背后是一个 specialist prompt 契约，且**下游刻意不信任上游**——Todo 重新解析 Backlog 的 story，Review 独立复核 Dev 的自证，Done 校验 Review 的 APPROVED verdict。
 
-### 2. 六位泳道 Specialist（契约改编自 `resources/specialists/workflows/kanban/*.yaml`）
+### 2. 六位泳道 Specialist
 
 | 泳道 | Specialist | 职责 | 写入卡片的工件 | 放行条件 |
 | --- | --- | --- | --- | --- |
@@ -115,7 +115,80 @@ npm start
 
 ### 阶段 5：平台扩展
 
-提供统一 Platform Console、Skill Registry、MCP JSON-RPC、路径/符号链接/命令参数边界、Coding Agent 自动 Docker Sandbox、Repository Intelligence、Harness/Fitness、Cron/时区/并发策略 Schedule、幂等/过滤/限流/HMAC Webhook，以及 GitHub Issues、PR、评论和交付。高风险操作可配置一次性 Approval 门禁。
+提供统一 Platform Console、版本化 Skill Registry、Skill 生成/导入/发布、统一代码扫描、MCP JSON-RPC、路径/符号链接/命令参数边界、Coding Agent 自动 Docker Sandbox、Repository Intelligence、Harness/Fitness、Cron/时区/并发策略 Schedule、幂等/过滤/限流/HMAC Webhook，以及 GitHub Issues、PR、Check Run、评论和交付。高风险操作可配置一次性 Approval 门禁。
+
+## Skills：生成、导入与版本发布
+
+Skill 包由 `SKILL.md` 和可选 `skill.json` 组成。支持三种来源：
+
+```json
+{"type":"content","skillMarkdown":"---\nname: code-review\nversion: 1.0.0\n---\n\n1. Review the diff..."}
+{"type":"directory","path":"/workspace/skills/code-review"}
+{"type":"git","url":"https://github.com/org/skills.git","ref":"v1.0.0","subdirectory":"skills/code-review"}
+```
+
+导入过程限制 100 个文件/1 MiB，拒绝符号链接、路径逃逸、URL 内嵌凭证和危险命令声明。外部目录与所有 Git 来源需要一次性 Approval。每次导入保存不可变版本、SHA-256 Checksum、来源 URI/Commit 和 Sandbox Policy Validation；版本先进入 `DRAFT`，批准后才能 `PUBLISHED`，并支持批准后回滚。包含扫描器的 `pre-dev`、`post-dev`、`review` Hook 会自动生成对应 Scan Profile 并进入交付门禁。发布后的完整 Skill 包会在 Agent 执行期间临时物化到任务 Worktree 的 `.lucapi-skills/<name>`，供 instructions、references 和 scripts 使用，并在验证/提交前清理，绝不进入产品 Diff。真实 Provider 可执行“需求描述 → Skill 草稿”生成。内置 Skill 包括 `code-review`、`security-scan` 和 `sonarqube`。
+
+主要 API：
+
+| Method | Path | 说明 |
+| --- | --- | --- |
+| POST | `/api/skills/import` | 从 content/directory/git 导入 |
+| POST | `/api/skills/generate` | 使用真实 LLM 生成 Skill 草稿 |
+| POST | `/api/skills/builtins` | 安装三个内置 Skill 草稿 |
+| GET | `/api/skills/:id/versions` | 不可变版本历史 |
+| POST | `/api/skill-versions/:id/validate` | 重新执行 Sandbox Policy Validation |
+| POST | `/api/skill-versions/:id/request-publish` | 创建发布 Approval |
+| POST | `/api/skill-versions/:id/publish` | 消费 Approval 并发布/回滚版本 |
+
+## Code Review、SonarQube 与安全扫描
+
+`Scan Profile → Durable scan.run Job → Scan Run → Normalized Findings → Review Gate`。统一 Finding 包含 scanner、rule ID、severity、category、文件/行号、fingerprint、是否新增和抑制状态。Review Hook 会阻断配置的严重度；Scanner 基础设施失败由 `failOnScannerError` 决定，绝不伪造扫描通过。
+
+支持：
+
+- `code-review`：真实 Diff + Acceptance Criteria 的独立模型评审
+- `lucapi-secret`：内置私钥、凭证模式和敏感文件检测
+- Gitleaks、Semgrep、Trivy、OSV-Scanner：宿主 CLI 或固定版本 Docker 镜像
+- SonarQube/SonarCloud：Scanner、Compute Engine 轮询、Quality Gate、Issues、Branch/PR Analysis
+- SARIF 2.1.0 导入/导出
+- Finding Fingerprint、New Findings Only 和跨运行 Suppression
+- GitHub Check Run、最多 50 条 Annotation、PR 评论和可选 APPROVE/REQUEST_CHANGES Review
+
+Profile 示例：
+
+```json
+{
+  "workspaceId": "...",
+  "name": "Security Gate",
+  "hook": "review",
+  "scanners": ["lucapi-secret", "gitleaks", "semgrep", "trivy", "osv-scanner"],
+  "policy": {
+    "blockOn": ["critical", "high"],
+    "failOnScannerError": true,
+    "newFindingsOnly": true
+  },
+  "config": {
+    "execution": "docker",
+    "network": false,
+    "timeoutMs": 300000
+  }
+}
+```
+
+Sonar Profile 的 `config.sonarqube` 接受 `serverUrl`、`projectKey`、`organization`、`token`、`branch` 或 `pullRequest`。Token 使用 `LUCAPI_SECRET_KEY` 加密且 API 只返回 `hasToken`。Sonar 和其他联网扫描在执行前自动创建一次性 `scan.network` Approval。
+
+扫描 API：
+
+| Method | Path | 说明 |
+| --- | --- | --- |
+| GET/POST | `/api/scan-profiles` | 管理扫描 Profile |
+| POST | `/api/scans/run` | 通过持久化队列执行 Profile |
+| GET | `/api/scans/:id` | Run、Summary 与 Findings |
+| POST | `/api/scans/import-sarif` | 导入 SARIF |
+| GET | `/api/scans/:id/sarif` | 导出 SARIF |
+| POST | `/api/scan-findings/:id/suppress` | 按 Fingerprint 抑制/恢复 |
+| POST | `/api/scans/:id/publish-github` | 发布 Check Run 和可选 PR 评论 |
 
 ## 生产运行与安全配置
 
@@ -161,11 +234,14 @@ src/specialists.js   # 六位泳道 specialist 的 prompt 契约 + entry gates +
 src/engine.js        # 交付引擎：distrust 门、决策应用、automation sweep
 src/providers.js     # LLM provider 抽象（simulated / OpenAI 兼容）
 src/git.js            # worktree git 操作（status / pull / commit+push）
-src/github.js         # GitHub REST API（slug 推断、创建/查找 PR）
+src/github.js         # GitHub REST API（PR、评论和 Check Run）
+src/skill-service.js  # Skill Manifest、导入、生成、版本、验证与发布
+src/scan-service.js   # Code Review、Sonar、安全扫描、SARIF 与门禁
 public/               # 看板 SPA（泳道、卡片抽屉、工件时间线、session/trace、Providers 与 Git 面板）
 test/smoke.js         # 60 项基础端到端检查
-test/platform.js      # 45 项真实 Agent、worktree、队列、DAG、安全与平台集成检查
+test/platform.js      # 48 项真实 Agent、worktree、队列、DAG、安全与平台集成检查
 test/hardening.js     # 4 项多 Worker 原子领取、Lease 恢复、死信恢复与凭证静态加密检查
+test/skills-scanning.js # 22 项 Skill 生命周期、SARIF、安全扫描与 SonarQube 检查
 ```
 
 ## 设计边界

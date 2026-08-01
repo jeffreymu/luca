@@ -149,6 +149,69 @@ export function openDb(dbPath = "lucapi.db") {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS skill_versions (
+      id TEXT PRIMARY KEY,
+      skill_id TEXT NOT NULL,
+      version TEXT NOT NULL,
+      manifest TEXT NOT NULL,
+      content TEXT NOT NULL,
+      checksum TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      source_uri TEXT,
+      source_ref TEXT,
+      status TEXT NOT NULL DEFAULT 'DRAFT',
+      created_at TEXT NOT NULL,
+      published_at TEXT,
+      UNIQUE(skill_id, version)
+    );
+    CREATE TABLE IF NOT EXISTS scan_profiles (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      hook TEXT NOT NULL DEFAULT 'review',
+      scanners TEXT NOT NULL,
+      policy TEXT NOT NULL,
+      config TEXT NOT NULL DEFAULT '{}',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS scan_runs (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      card_id TEXT,
+      profile_id TEXT,
+      status TEXT NOT NULL,
+      base_commit TEXT,
+      head_commit TEXT,
+      summary TEXT NOT NULL DEFAULT '{}',
+      started_at TEXT NOT NULL,
+      finished_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS scan_suppressions (
+      workspace_id TEXT NOT NULL,
+      fingerprint TEXT NOT NULL,
+      reason TEXT,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(workspace_id, fingerprint)
+    );
+    CREATE TABLE IF NOT EXISTS scan_findings (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      scanner TEXT NOT NULL,
+      rule_id TEXT,
+      severity TEXT NOT NULL,
+      category TEXT,
+      file TEXT,
+      start_line INTEGER,
+      end_line INTEGER,
+      message TEXT NOT NULL,
+      fingerprint TEXT NOT NULL,
+      is_new INTEGER NOT NULL DEFAULT 1,
+      suppressed INTEGER NOT NULL DEFAULT 0,
+      raw TEXT,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS webhook_configs (
       id TEXT PRIMARY KEY,
       workspace_id TEXT NOT NULL,
@@ -222,6 +285,11 @@ export function openDb(dbPath = "lucapi.db") {
     CREATE INDEX IF NOT EXISTS idx_cards_board ON cards(board_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_card ON sessions(card_id);
     CREATE INDEX IF NOT EXISTS idx_traces_session ON traces(session_id);
+    CREATE INDEX IF NOT EXISTS idx_skill_versions_skill ON skill_versions(skill_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_scan_profiles_workspace_hook ON scan_profiles(workspace_id, hook, enabled);
+    CREATE INDEX IF NOT EXISTS idx_scan_runs_workspace ON scan_runs(workspace_id, started_at);
+    CREATE INDEX IF NOT EXISTS idx_scan_findings_run ON scan_findings(run_id, severity);
+    CREATE INDEX IF NOT EXISTS idx_scan_findings_fingerprint ON scan_findings(fingerprint);
   `);
   // Idempotent column migrations for existing databases.
   for (const ddl of [
@@ -252,6 +320,14 @@ export function openDb(dbPath = "lucapi.db") {
     "ALTER TABLE schedules ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'",
     "ALTER TABLE schedules ADD COLUMN lease_until TEXT",
     "ALTER TABLE schedules ADD COLUMN worker_id TEXT",
+    "ALTER TABLE skills ADD COLUMN current_version TEXT NOT NULL DEFAULT '1.0.0'",
+    "ALTER TABLE skills ADD COLUMN status TEXT NOT NULL DEFAULT 'PUBLISHED'",
+    "ALTER TABLE skills ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE skills ADD COLUMN manifest TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE skills ADD COLUMN source_type TEXT NOT NULL DEFAULT 'manual'",
+    "ALTER TABLE skills ADD COLUMN source_uri TEXT",
+    "ALTER TABLE skills ADD COLUMN checksum TEXT",
+    "ALTER TABLE skill_versions ADD COLUMN validation_result TEXT",
   ]) {
     try {
       db.exec(ddl);
@@ -262,7 +338,8 @@ export function openDb(dbPath = "lucapi.db") {
   db.prepare("INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)").run(1,"initial-schema",new Date().toISOString());
   db.prepare("INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)").run(2,"autonomous-platform-hardening",new Date().toISOString());
   db.prepare("INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)").run(3,"production-hardening",new Date().toISOString());
-  db.exec("PRAGMA user_version = 3");
+  db.prepare("INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)").run(4,"versioned-skills-and-scanning",new Date().toISOString());
+  db.exec("PRAGMA user_version = 4");
   return db;
 }
 
@@ -293,6 +370,7 @@ export class Store {
       for(const row of db.prepare("SELECT id,api_key FROM providers").all())if(row.api_key&&!row.api_key.startsWith("enc:v1:"))db.prepare("UPDATE providers SET api_key=? WHERE id=?").run(this.secrets.encode(row.api_key),row.id);
       for(const row of db.prepare("SELECT id,github_token FROM workspaces").all())if(row.github_token&&!row.github_token.startsWith("enc:v1:"))db.prepare("UPDATE workspaces SET github_token=? WHERE id=?").run(this.secrets.encode(row.github_token),row.id);
       for(const row of db.prepare("SELECT id,secret FROM webhook_configs").all())if(row.secret&&!row.secret.startsWith("enc:v1:"))db.prepare("UPDATE webhook_configs SET secret=? WHERE id=?").run(this.secrets.encode(row.secret),row.id);
+      for(const row of db.prepare("SELECT id,config FROM scan_profiles").all()){const config=JSON.parse(row.config||"{}"),token=config.sonarqube?.token;if(token&&!token.startsWith("enc:v1:")){config.sonarqube.token=this.secrets.encode(token);db.prepare("UPDATE scan_profiles SET config=? WHERE id=?").run(JSON.stringify(config),row.id);}}
     }
   }
 
@@ -363,7 +441,9 @@ export class Store {
       for(const hook of this.db.prepare("SELECT id FROM webhook_configs WHERE workspace_id=?").all(id))this.db.prepare("DELETE FROM webhook_logs WHERE config_id=?").run(hook.id);
       for(const run of this.db.prepare("SELECT id FROM team_runs WHERE workspace_id=?").all(id)){this.db.prepare("DELETE FROM team_messages WHERE team_run_id=?").run(run.id);this.db.prepare("DELETE FROM approvals WHERE team_run_id=?").run(run.id);}
       for(const schedule of this.db.prepare("SELECT id FROM schedules WHERE workspace_id=?").all(id))this.db.prepare("DELETE FROM schedule_runs WHERE schedule_id=?").run(schedule.id);
-      for(const table of ["jobs","workflows","schedules","skills","webhook_configs","agents","team_runs","operation_approvals"])this.db.prepare(`DELETE FROM ${table} WHERE workspace_id=?`).run(id);
+      for(const run of this.db.prepare("SELECT id FROM scan_runs WHERE workspace_id=?").all(id))this.db.prepare("DELETE FROM scan_findings WHERE run_id=?").run(run.id);
+      for(const skill of this.db.prepare("SELECT id FROM skills WHERE workspace_id=?").all(id))this.db.prepare("DELETE FROM skill_versions WHERE skill_id=?").run(skill.id);
+      for(const table of ["jobs","workflows","schedules","skills","scan_profiles","scan_runs","scan_suppressions","webhook_configs","agents","team_runs","operation_approvals"])this.db.prepare(`DELETE FROM ${table} WHERE workspace_id=?`).run(id);
       this.db.prepare("DELETE FROM workspaces WHERE id=?").run(id);this.db.exec("COMMIT");
     }catch(err){this.db.exec("ROLLBACK");throw err;}
   }
@@ -585,14 +665,40 @@ export class Store {
   updateScheduleRunByJob(jobId,status){this.db.prepare("UPDATE schedule_runs SET status=? WHERE job_id=?").run(status,jobId);}
   listScheduleRuns(scheduleId){return this.db.prepare("SELECT * FROM schedule_runs WHERE schedule_id=? ORDER BY created_at DESC LIMIT 100").all(scheduleId);}
 
-  createSkill({ workspaceId = null, name, description = "", instructions, tools = [] }) {
-    const id = randomUUID();
-    this.db.prepare("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?)").run(id, workspaceId, name, description, instructions, JSON.stringify(tools), now(), now());
-    return parseJsonColumns(this.db.prepare("SELECT * FROM skills WHERE id=?").get(id), ["tools"]);
+  createSkill({ workspaceId = null, name, description = "", instructions, tools = [], version="1.0.0", status="PUBLISHED", manifest={}, sourceType="manual", sourceUri=null, sourceRef=null, checksum=null, content=null }) {
+    const id=randomUUID(),timestamp=now();
+    this.db.prepare(`INSERT INTO skills (id,workspace_id,name,description,instructions,tools,created_at,updated_at,current_version,status,enabled,manifest,source_type,source_uri,checksum) VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)`).run(id,workspaceId,name,description,instructions,JSON.stringify(tools),timestamp,timestamp,version,status,JSON.stringify(manifest),sourceType,sourceUri,checksum);
+    if(content!==null)this.addSkillVersion({skillId:id,version,manifest,content,checksum:checksum??"",sourceType,sourceUri,sourceRef,status});
+    return this.getSkill(id);
   }
-  listSkills(workspaceId) { return this.db.prepare("SELECT * FROM skills WHERE workspace_id IS NULL OR workspace_id=? ORDER BY name").all(workspaceId).map((r)=>parseJsonColumns(r,["tools"])); }
-  updateSkill(id,patch){const s=parseJsonColumns(this.db.prepare("SELECT * FROM skills WHERE id=?").get(id),["tools"]);if(!s)return null;this.db.prepare("UPDATE skills SET name=?,description=?,instructions=?,tools=?,updated_at=? WHERE id=?").run(patch.name??s.name,patch.description??s.description,patch.instructions??s.instructions,JSON.stringify(patch.tools??s.tools),now(),id);return parseJsonColumns(this.db.prepare("SELECT * FROM skills WHERE id=?").get(id),["tools"]);}
-  deleteSkill(id) { this.db.prepare("DELETE FROM skills WHERE id=?").run(id); }
+  findSkillByName(workspaceId,name){return parseJsonColumns(this.db.prepare("SELECT * FROM skills WHERE workspace_id=? AND name=? ORDER BY created_at LIMIT 1").get(workspaceId,name),["tools","manifest"]);}
+  getSkill(id){return parseJsonColumns(this.db.prepare("SELECT * FROM skills WHERE id=?").get(id),["tools","manifest"]);}
+  listSkills(workspaceId,{publishedOnly=true}={}) { let sql="SELECT * FROM skills WHERE (workspace_id IS NULL OR workspace_id=?)";if(publishedOnly)sql+=" AND status='PUBLISHED' AND enabled=1";sql+=" ORDER BY name";return this.db.prepare(sql).all(workspaceId).map((r)=>parseJsonColumns(r,["tools","manifest"])); }
+  updateSkill(id,patch){const s=this.getSkill(id);if(!s)return null;const enabled=patch.enabled===undefined?s.enabled:patch.enabled?1:0;this.db.prepare("UPDATE skills SET name=?,description=?,instructions=?,tools=?,enabled=?,manifest=?,updated_at=? WHERE id=?").run(patch.name??s.name,patch.description??s.description,patch.instructions??s.instructions,JSON.stringify(patch.tools??s.tools),enabled,JSON.stringify(patch.manifest??s.manifest),now(),id);for(const profile of this.listScanProfiles(s.workspace_id).filter((p)=>p.config?.skillId===id))this.updateScanProfile(profile.id,{enabled:Boolean(enabled)});return this.getSkill(id);}
+  addSkillVersion({skillId,version,manifest,content,checksum,sourceType,sourceUri=null,sourceRef=null,status="DRAFT"}){const id=randomUUID();this.db.prepare("INSERT INTO skill_versions (id,skill_id,version,manifest,content,checksum,source_type,source_uri,source_ref,status,created_at,published_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)").run(id,skillId,version,JSON.stringify(manifest),content,checksum,sourceType,sourceUri,sourceRef,status,now());return this.getSkillVersion(id);}
+  getSkillVersion(id){return parseJsonColumns(this.db.prepare("SELECT * FROM skill_versions WHERE id=?").get(id),["manifest","validation_result"]);}
+  setSkillVersionValidation(id,result){this.db.prepare("UPDATE skill_versions SET validation_result=? WHERE id=?").run(JSON.stringify(result),id);return this.getSkillVersion(id);}
+  getPublishedSkillPackage(skillId){const skill=this.getSkill(skillId);if(!skill?.current_version)return null;const version=this.db.prepare("SELECT * FROM skill_versions WHERE skill_id=? AND version=? AND status='PUBLISHED' ORDER BY published_at DESC LIMIT 1").get(skillId,skill.current_version);if(!version)return null;try{return JSON.parse(version.content);}catch{return null;}}
+  listSkillVersions(skillId){return this.db.prepare("SELECT * FROM skill_versions WHERE skill_id=? ORDER BY created_at DESC, rowid DESC").all(skillId).map((r)=>parseJsonColumns(r,["manifest"]));}
+  publishSkillVersion(versionId){const version=this.getSkillVersion(versionId);if(!version)return null;const timestamp=now();this.db.prepare("UPDATE skill_versions SET status='PUBLISHED',published_at=? WHERE id=?").run(timestamp,versionId);this.db.prepare("UPDATE skill_versions SET status='ARCHIVED' WHERE skill_id=? AND id<>? AND status='PUBLISHED'").run(version.skill_id,versionId);this.db.prepare("UPDATE skills SET current_version=?,status='PUBLISHED',manifest=?,checksum=?,source_type=?,source_uri=?,updated_at=? WHERE id=?").run(version.version,JSON.stringify(version.manifest),version.checksum,version.source_type,version.source_uri,timestamp,version.skill_id);return this.getSkill(version.skill_id);}
+  deleteSkill(id) { const skill=this.getSkill(id);if(skill)for(const profile of this.listScanProfiles(skill.workspace_id).filter((p)=>p.config?.skillId===id))this.deleteScanProfile(profile.id);this.db.prepare("DELETE FROM skill_versions WHERE skill_id=?").run(id);this.db.prepare("DELETE FROM skills WHERE id=?").run(id); }
+
+  encodeScanConfig(config={}){const copy=structuredClone(config);if(copy.sonarqube?.token)copy.sonarqube.token=this.secrets.encode(copy.sonarqube.token);return copy;}
+  decodeScanProfile(row){const p=parseJsonColumns(row,["scanners","policy","config"]);if(p?.config?.sonarqube?.token)p.config.sonarqube.token=this.secrets.decode(p.config.sonarqube.token);return p;}
+  createScanProfile({workspaceId,name,hook="review",scanners=[],policy={},config={},enabled=true}){const id=randomUUID(),timestamp=now();this.db.prepare("INSERT INTO scan_profiles VALUES (?,?,?,?,?,?,?,?,?,?)").run(id,workspaceId,name,hook,JSON.stringify(scanners),JSON.stringify(policy),JSON.stringify(this.encodeScanConfig(config)),enabled?1:0,timestamp,timestamp);return this.getScanProfile(id);}
+  getScanProfile(id){return this.decodeScanProfile(this.db.prepare("SELECT * FROM scan_profiles WHERE id=?").get(id));}
+  listScanProfiles(workspaceId,{hook,enabledOnly=false}={}){let sql="SELECT * FROM scan_profiles WHERE workspace_id=?",args=[workspaceId];if(hook){sql+=" AND hook=?";args.push(hook);}if(enabledOnly)sql+=" AND enabled=1";sql+=" ORDER BY created_at";return this.db.prepare(sql).all(...args).map((r)=>this.decodeScanProfile(r));}
+  updateScanProfile(id,patch){const p=this.getScanProfile(id);if(!p)return null;const config=patch.config??p.config;this.db.prepare("UPDATE scan_profiles SET name=?,hook=?,scanners=?,policy=?,config=?,enabled=?,updated_at=? WHERE id=?").run(patch.name??p.name,patch.hook??p.hook,JSON.stringify(patch.scanners??p.scanners),JSON.stringify(patch.policy??p.policy),JSON.stringify(this.encodeScanConfig(config)),patch.enabled===undefined?p.enabled:patch.enabled?1:0,now(),id);return this.getScanProfile(id);}
+  deleteScanProfile(id){this.db.prepare("DELETE FROM scan_profiles WHERE id=?").run(id);}
+  createScanRun({workspaceId,cardId=null,profileId=null,baseCommit=null,headCommit=null}){const id=randomUUID();this.db.prepare("INSERT INTO scan_runs (id,workspace_id,card_id,profile_id,status,base_commit,head_commit,started_at) VALUES (?,?,?,?,'RUNNING',?,?,?)").run(id,workspaceId,cardId,profileId,baseCommit,headCommit,now());return this.getScanRun(id);}
+  finishScanRun(id,status,summary={}){this.db.prepare("UPDATE scan_runs SET status=?,summary=?,finished_at=? WHERE id=?").run(status,JSON.stringify(summary),now(),id);return this.getScanRun(id);}
+  addScanFinding(runId,finding){const id=randomUUID();this.db.prepare("INSERT INTO scan_findings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(id,runId,finding.scanner,finding.ruleId??null,finding.severity,finding.category??null,finding.file??null,finding.startLine??null,finding.endLine??null,finding.message,finding.fingerprint,finding.isNew===false?0:1,finding.suppressed?1:0,JSON.stringify(finding.raw??null),now());return id;}
+  getScanRun(id){const run=parseJsonColumns(this.db.prepare("SELECT * FROM scan_runs WHERE id=?").get(id),["summary"]);return run?{...run,findings:this.listScanFindings(id)}:null;}
+  listScanRuns(workspaceId,{cardId,limit=100}={}){let sql="SELECT * FROM scan_runs WHERE workspace_id=?",args=[workspaceId];if(cardId){sql+=" AND card_id=?";args.push(cardId);}sql+=" ORDER BY started_at DESC LIMIT ?";args.push(limit);return this.db.prepare(sql).all(...args).map((r)=>parseJsonColumns(r,["summary"]));}
+  knownScanFingerprints(profileId,excludeRunId){return new Set(this.db.prepare("SELECT DISTINCT f.fingerprint FROM scan_findings f JOIN scan_runs r ON r.id=f.run_id WHERE r.profile_id=? AND r.id<>? AND r.status='PASSED'").all(profileId,excludeRunId).map((r)=>r.fingerprint));}
+  listScanFindings(runId){return this.db.prepare("SELECT * FROM scan_findings WHERE run_id=? ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,file,start_line").all(runId).map((f)=>({...f,raw:JSON.parse(f.raw||"null")}));}
+  suppressedScanFingerprints(workspaceId){return new Set(this.db.prepare("SELECT fingerprint FROM scan_suppressions WHERE workspace_id=?").all(workspaceId).map((r)=>r.fingerprint));}
+  suppressScanFinding(id,suppressed=true,reason=""){const f=this.db.prepare("SELECT f.*,r.workspace_id FROM scan_findings f JOIN scan_runs r ON r.id=f.run_id WHERE f.id=?").get(id);if(!f)return null;this.db.prepare("UPDATE scan_findings SET suppressed=? WHERE id=?").run(suppressed?1:0,id);if(suppressed)this.db.prepare("INSERT INTO scan_suppressions VALUES (?,?,?,?) ON CONFLICT(workspace_id,fingerprint) DO UPDATE SET reason=excluded.reason").run(f.workspace_id,f.fingerprint,reason,now());else this.db.prepare("DELETE FROM scan_suppressions WHERE workspace_id=? AND fingerprint=?").run(f.workspace_id,f.fingerprint);return this.db.prepare("SELECT * FROM scan_findings WHERE id=?").get(id);}
 
   createWebhook({ workspaceId, workflowId, event, secret = null, filters = {} }) {
     const id = randomUUID();

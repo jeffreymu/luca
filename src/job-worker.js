@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { ScanService } from "./scan-service.js";
 
 export class DurableWorker {
   constructor({ store, engine, broadcast, intervalMs = 250, maxConcurrency = 2, workerId = process.env.LUCAPI_WORKER_ID ?? `worker-${randomUUID().slice(0,8)}` }) {
@@ -39,6 +40,9 @@ export class DurableWorker {
     finally { clearInterval(heartbeat);this.store.releaseExecutionLease(resourceType,resourceId,this.workerId); }
   }
   async execute(job) {
+    if(job.type==="scan.run"){
+      const workspace=this.store.getWorkspace(job.workspace_id),profile=this.store.getScanProfile(job.payload.profileId),card=job.card_id?this.store.getCard(job.card_id):null;if(!workspace||!profile)throw new Error("Scan workspace or profile not found");const root=job.payload.root||card?.worktree_path||workspace.repo_path,provider=this.engine.getProviders(profile.config?.providerId??null);const story=card?[...card.artifacts].reverse().find((a)=>a.type==="story")?.data?.story:null;return new ScanService(this.store).runProfile({profile,workspace,card,root,baseCommit:job.payload.baseCommit??card?.base_commit,headCommit:job.payload.headCommit??card?.head_commit,provider:provider.mode==="llm"?provider.primary:null,acceptanceCriteria:story?.acceptance_criteria??[],shouldCancel:()=>this.store.getJob(job.id)?.status==="CANCELLED"});
+    }
     if(job.type==="card.run") return this.engine.runCard(job.card_id);
     if(job.type==="board.run") return this.engine.runBoard(job.board_id);
     if(job.type==="team.run") {

@@ -5,13 +5,16 @@ import { SPECIALISTS, LANES, listSpecialists } from "./specialists.js";
 import { analyzeRepository } from "./repository.js";
 import { gitStatus, runGit } from "./git.js";
 import { WorktreeManager } from "./worktree.js";
-import { createPullRequest, listIssues, listPullRequests, parseGitHubSlug, postPullRequestComment } from "./github.js";
+import { createCheckRun, createPullRequest, createPullRequestReview, listIssues, listPullRequests, parseGitHubSlug, postPullRequestComment } from "./github.js";
+import { BUILTIN_SKILLS, SkillService } from "./skill-service.js";
+import { ScanService, validateScanProfileInput } from "./scan-service.js";
 import { inspectHarness } from "./harness.js";
 import { DockerSandboxManager } from "./sandbox.js";
 import { ToolExecutor } from "./agent-runtime.js";
 
 const dockerSandboxes = new DockerSandboxManager();
 const webhookWindows=new Map();
+function serializeScanProfile(profile){if(!profile)return profile;const config=structuredClone(profile.config??{}),token=config.sonarqube?.token;if(config.sonarqube)config.sonarqube={...config.sonarqube,token:undefined,hasToken:Boolean(token)};return{...profile,config};}
 function acceptWebhookRate(workspaceId,limit=120){const minute=Math.floor(Date.now()/60_000),current=webhookWindows.get(workspaceId);if(!current||current.minute!==minute){webhookWindows.set(workspaceId,{minute,count:1});return true;}current.count++;return current.count<=limit;}
 
 export async function handlePlatformApi(ctx) {
@@ -114,13 +117,46 @@ export async function handlePlatformApi(ctx) {
   if(path==="/api/schedules/tick"&&method==="POST") { await worker.tick(); json(res,200,{ok:true}); return true; }
 
   if(path==="/api/skills") {
-    if(method==="GET") { json(res,200,store.listSkills(url.searchParams.get("workspaceId"))); return true; }
+    if(method==="GET") { const skills=store.listSkills(url.searchParams.get("workspaceId"),{publishedOnly:url.searchParams.get("includeDrafts")!=="true"}).map((skill)=>({...skill,hasDraft:store.listSkillVersions(skill.id).some((version)=>version.status==="DRAFT")}));json(res,200,skills); return true; }
     if(method==="POST") { const b=await readBody(req); json(res,201,store.createSkill(b)); return true; }
     if(method==="DELETE") { const b=await readBody(req); store.deleteSkill(b.id); json(res,200,{ok:true}); return true; }
   }
+  if(path==="/api/skills/import"&&method==="POST"){const b=await readBody(req);try{json(res,201,await new SkillService(store).importSkill(b));}catch(e){badRequest(res,e.message);}return true;}
+  if(path==="/api/skills/generate"&&method==="POST"){const b=await readBody(req),providers=ctx.engine.getProviders(b.providerId??null);if(providers.mode!=="llm"){badRequest(res,"A real LLM provider is required");return true;}try{json(res,201,await new SkillService(store).generateSkill({workspaceId:b.workspaceId,prompt:b.prompt,provider:providers.primary}));}catch(e){badRequest(res,e.message);}return true;}
+  if(path==="/api/skills/builtins"&&method==="POST"){const b=await readBody(req),service=new SkillService(store),installed=[];for(const builtin of BUILTIN_SKILLS){const markdown=`---\nname: ${builtin.name}\nversion: ${builtin.version}\ndescription: ${builtin.description}\n---\n\n${builtin.instructions}`;installed.push(await service.importSkill({workspaceId:b.workspaceId,source:{type:"content",skillMarkdown:markdown,manifest:builtin}}));}json(res,201,{installed});return true;}
+  const skillVersions=path.match(/^\/api\/skills\/([^/]+)\/versions$/);
+  if(skillVersions&&method==="GET"){json(res,200,store.listSkillVersions(skillVersions[1]));return true;}
+  const skillValidate=path.match(/^\/api\/skill-versions\/([^/]+)\/validate$/);
+  if(skillValidate&&method==="POST"){const b=await readBody(req),workspace=store.getWorkspace(b.workspaceId);if(!workspace){notFound(res);return true;}try{json(res,200,new SkillService(store).validateVersion(skillValidate[1],workspace));}catch(e){badRequest(res,e.message);}return true;}
+  const skillPublishRequest=path.match(/^\/api\/skill-versions\/([^/]+)\/request-publish$/);
+  if(skillPublishRequest&&method==="POST"){const b=await readBody(req);try{json(res,201,new SkillService(store).requestPublish(skillPublishRequest[1],b.workspaceId));}catch(e){badRequest(res,e.message);}return true;}
+  const skillPublish=path.match(/^\/api\/skill-versions\/([^/]+)\/publish$/);
+  if(skillPublish&&method==="POST"){const b=await readBody(req);try{json(res,200,new SkillService(store).publish(skillPublish[1],b.workspaceId,b.approvalId));}catch(e){json(res,403,{error:e.message});}return true;}
+  const skillRelease=path.match(/^\/api\/skills\/([^/]+)\/(request-publish|publish)$/);
+  if(skillRelease&&method==="POST"){const b=await readBody(req),skill=store.getSkill(skillRelease[1]),version=skill?store.listSkillVersions(skill.id)[0]:null;if(!skill||!version){notFound(res);return true;}const service=new SkillService(store);try{if(skillRelease[2]==="request-publish")json(res,201,service.requestPublish(version.id,b.workspaceId||skill.workspace_id));else{const approval=store.listOperationApprovals(b.workspaceId||skill.workspace_id).find((a)=>a.operation==="skill.publish"&&a.resource_id===version.id&&a.status==="APPROVED"&&!a.consumed_at);json(res,200,service.publish(version.id,b.workspaceId||skill.workspace_id,b.approvalId||approval?.id));}}catch(e){json(res,403,{error:e.message});}return true;}
   const skillMatch=path.match(/^\/api\/skills\/([^/]+)$/);
   if(skillMatch&&method==="PATCH"){const b=await readBody(req),s=store.updateSkill(skillMatch[1],b);s?json(res,200,s):notFound(res);return true;}
   if(skillMatch&&method==="DELETE"){store.deleteSkill(skillMatch[1]);json(res,200,{ok:true});return true;}
+
+  if(path==="/api/scan-profiles"){
+    if(method==="GET"){json(res,200,store.listScanProfiles(url.searchParams.get("workspaceId"),{hook:url.searchParams.get("hook")||undefined}).map(serializeScanProfile));return true;}
+    if(method==="POST"){const b=await readBody(req);try{if(!store.getWorkspace(b.workspaceId))throw new Error("Workspace not found");validateScanProfileInput(b);json(res,201,serializeScanProfile(store.createScanProfile(b)));}catch(e){badRequest(res,e.message);}return true;}
+  }
+  const profileMatch=path.match(/^\/api\/scan-profiles\/([^/]+)$/);
+  if(profileMatch&&method==="GET"){const p=store.getScanProfile(profileMatch[1]);p?json(res,200,serializeScanProfile(p)):notFound(res);return true;}
+  if(profileMatch&&method==="PATCH"){const b=await readBody(req),existing=store.getScanProfile(profileMatch[1]);if(!existing){notFound(res);return true;}try{if(b.config?.sonarqube?.hasToken&&existing.config?.sonarqube?.token&&!b.config.sonarqube.token)b.config.sonarqube.token=existing.config.sonarqube.token;validateScanProfileInput({...existing,...b});json(res,200,serializeScanProfile(store.updateScanProfile(profileMatch[1],b)));}catch(e){badRequest(res,e.message);}return true;}
+  if(profileMatch&&method==="DELETE"){store.deleteScanProfile(profileMatch[1]);json(res,200,{ok:true});return true;}
+  if(path==="/api/scans/run"&&method==="POST"){const b=await readBody(req),profile=store.getScanProfile(b.profileId);if(!profile){notFound(res);return true;}const workspace=store.getWorkspace(profile.workspace_id),card=b.cardId?store.getCard(b.cardId):null;if(!workspace){notFound(res);return true;}const job=store.createJob({type:"scan.run",workspaceId:workspace.id,boardId:card?.board_id,cardId:card?.id,payload:{profileId:profile.id,root:card?.worktree_path||workspace.repo_path,baseCommit:b.baseCommit,headCommit:b.headCommit},priority:b.priority??0});json(res,202,job);return true;}
+  if(path==="/api/scans/import-sarif"&&method==="POST"){const b=await readBody(req);try{json(res,201,new ScanService(store).importSarif(b));}catch(e){badRequest(res,e.message);}return true;}
+  if(path==="/api/scans"&&method==="GET"){json(res,200,store.listScanRuns(url.searchParams.get("workspaceId"),{cardId:url.searchParams.get("cardId")||undefined}));return true;}
+  const scanSarif=path.match(/^\/api\/scans\/([^/]+)\/sarif$/);
+  if(scanSarif&&method==="GET"){try{json(res,200,new ScanService(store).exportSarif(scanSarif[1]));}catch(e){notFound(res);}return true;}
+  const scanPublish=path.match(/^\/api\/scans\/([^/]+)\/publish-github$/);
+  if(scanPublish&&method==="POST"){const b=await readBody(req),run=store.getScanRun(scanPublish[1]),workspace=run?store.getWorkspace(run.workspace_id):null;if(!run||!workspace?.github_token){badRequest(res,"Scan run and GitHub token required");return true;}const remote=workspace.repo_path?(await gitStatus(workspace.repo_path)).remoteUrl:null,slug=workspace.github_repo??parseGitHubSlug(remote);if(!slug){badRequest(res,"GitHub repo slug required");return true;}const blocking=run.findings.filter((f)=>!f.suppressed&&["critical","high"].includes(f.severity)),summary=`${run.status}: ${run.findings.length} findings, ${blocking.length} blocking`,annotations=run.findings.filter((f)=>f.file).map((f)=>({path:f.file,startLine:f.start_line, endLine:f.end_line,level:["critical","high"].includes(f.severity)?"failure":f.severity==="medium"?"warning":"notice",message:f.message,title:`${f.scanner}: ${f.rule_id}`}));const check=await createCheckRun({apiBase:workspace.github_api_base??"https://api.github.com",token:workspace.github_token,slug,name:b.name||"LucaPi Scan",headSha:b.headSha||run.head_commit,status:"completed",conclusion:blocking.length?"failure":"success",summary,annotations});let comment=null,review=null;if(b.pullRequestNumber)comment=await postPullRequestComment({apiBase:workspace.github_api_base??"https://api.github.com",token:workspace.github_token,slug,number:b.pullRequestNumber,body:`## LucaPi Scan\n\n${summary}\n\n${blocking.slice(0,20).map((f)=>`- **${f.severity}** ${f.file??""}: ${f.message}`).join("\n")}`});if(b.pullRequestNumber&&b.createReview)review=await createPullRequestReview({apiBase:workspace.github_api_base??"https://api.github.com",token:workspace.github_token,slug,number:b.pullRequestNumber,event:blocking.length?"REQUEST_CHANGES":"APPROVE",body:summary,comments:run.findings.filter((f)=>f.file&&f.start_line).slice(0,100).map((f)=>({path:f.file,line:f.start_line,body:`${f.severity} · ${f.scanner}/${f.rule_id}: ${f.message}`}))});json(res,201,{check,comment,review});return true;}
+  const scanFinding=path.match(/^\/api\/scan-findings\/([^/]+)\/suppress$/);
+  if(scanFinding&&method==="POST"){const b=await readBody(req);json(res,200,store.suppressScanFinding(scanFinding[1],b.suppressed!==false,b.reason??""));return true;}
+  const scanMatch=path.match(/^\/api\/scans\/([^/]+)$/);
+  if(scanMatch&&method==="GET"){const run=store.getScanRun(scanMatch[1]);run?json(res,200,run):notFound(res);return true;}
 
   if(path==="/api/webhooks/logs"&&method==="GET") { json(res,200,store.listWebhookLogs(url.searchParams.get("workspaceId")));return true; }
   if(path==="/api/webhooks/configs") {

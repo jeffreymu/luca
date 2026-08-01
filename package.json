@@ -1,13 +1,13 @@
 {
   "name": "lucapi",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "LucaPi — workspace-first autonomous multi-agent delivery platform",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "worker": "node worker.js",
-    "test": "node test/smoke.js && node test/platform.js && node test/hardening.js"
+    "test": "node test/smoke.js && node test/platform.js && node test/hardening.js && node test/skills-scanning.js"
   },
   "engines": {
     "node": ">=22.5.0"

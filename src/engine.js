@@ -99,7 +99,7 @@ export class Engine {
       }
     }
     if (this.realExecution && lane === "review") {
-      try { produced = await this.realExecution.executeReview({ card, provider: providers.mode === "llm" ? providers.primary : null }); }
+      try { produced = await this.realExecution.executeReview({ card, provider: providers.mode === "llm" ? providers.primary : null, shouldCancel:()=>this.store.isSessionCancelRequested(sessionId) }); }
       catch (err) {
         trace("error", `独立真实评审失败: ${err.message}`);
         const hasRealEvidence=[...card.artifacts].reverse().find((artifact)=>artifact.type==="evidence")?.data?.evidence?.real===true;
